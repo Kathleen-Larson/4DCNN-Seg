@@ -5,7 +5,7 @@ import math
 import torch.nn.functional as F
 
 #mostly based off of https://github.com/ZhengyuLiang24/Conv4d-PyTorch/blob/main/Conv4d.py
-class Conv4d(nn.Module):
+class ConvTranspose4d(nn.Module):
     def __init__(self,
                  in_channels:int,
                  out_channels:int,
@@ -50,7 +50,7 @@ class Conv4d(nn.Module):
         self.groups = groups
         self.padding_mode = padding_mode
         self.X = X
-        self.t_dim = 2
+        self.T = 2
         
         
         # Construct weight and bias of 4D convolution
@@ -73,13 +73,13 @@ class Conv4d(nn.Module):
                 kernel_size = self.kernel_size[1::] if i in [(self.kernel_size[0] - 1)//2] else 1
 
             # Initialize a Conv3D layer
-            layer = eval('nn.Conv%dd' % X)(in_channels=self.in_channels, 
-                                           out_channels=self.out_channels,
-                                           kernel_size=kernel_size,
-                                           padding=self.padding[1::],
-                                           dilation=self.dilation[1::],
-                                           stride=self.stride[1::],
-                                           bias=False)
+            layer = eval('nn.ConvTranspose%dd' % X)(in_channels=self.in_channels, 
+                                                    out_channels=self.out_channels,
+                                                    kernel_size=kernel_size,
+                                                    padding=self.padding[1::],
+                                                    dilation=self.dilation[1::],
+                                                    stride=self.stride[1::],
+                                                    bias=False)
             layer.weight = nn.Parameter(self.weight[:, :, i, :, :])
 
             # Store the layer
@@ -95,8 +95,8 @@ class Conv4d(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
 
-
-    def forward(self, x):
+            
+    def forward(self, x, out_shape=None):
         if self.X == 3:
             (Batch, _, t_i, d_i, h_i, w_i) = tuple(x.shape)
             (t_k, h_k, w_k, d_k) = self.kernel_size
@@ -104,7 +104,7 @@ class Conv4d(nn.Module):
             (t_d, h_d, w_d, d_d) = self.dilation
             (t_s, h_s, w_s, d_s) = self.stride
 
-            t_o = (t_i + 2 * t_p - (t_k) - (t_k-1) * (t_d-1))//t_s + 1
+            t_o = (t_i - 1) * t_s - 2 * t_p - t_d * (t_k - 1) + 1
             out = [None] * t_o
             
             for i in range(t_k):
@@ -117,7 +117,7 @@ class Conv4d(nn.Module):
                     out[out_frame] = self.conv_layers[i](x[:,:,j,...]) if out[out_frame] is None \
                         else out[out_frame] + self.conv_layers[i](x[:,:,j,...])
 
-            out = torch.stack(out, dim=self.t_dim)
+            out = torch.stack(out, dim=self.T)
             
             if self.bias is not None:
                 out = out + self.bias.view(1,-1,1,1,1,1)
@@ -129,21 +129,22 @@ class Conv4d(nn.Module):
             (t_p, h_p, w_p) = self.padding
             (t_d, h_d, w_d) = self.dilation
             (t_s, h_s, w_s) = self.stride
-
-            t_o = (t_i + 2 * t_p - (t_k) - (t_k-1) * (t_d-1))//t_s + 1
+            
+            t_o = (t_i - 1) * t_s - 2 * t_p - t_d * (t_k - 1) + 1
             out = [None] * t_o
-
+            breakpoint()
             for i in range(t_k):
                 zero_offset = - t_p + (i * t_d)
                 j_start = max(zero_offset % t_s, zero_offset)
                 j_end = min(t_i, t_i + t_p - (t_k-i-1)*t_d)
-
+                
                 for j in range(j_start, j_end, t_s):
                     out_frame = (j - zero_offset) // t_s
                     out[out_frame] = self.conv_layers[i](x[:,:,j,...]) if out[out_frame] is None \
                         else out[out_frame] + self.conv_layers[i](x[:,:,j,...])
-
-            out = torch.stack(out, dim=self.t_dim)
+                    
+            breakpoint()
+            out = torch.stack(out, dim=self.T)
             
             if self.bias is not None:
                 out = out + self.bias.view(1,-1,1,1,1)
