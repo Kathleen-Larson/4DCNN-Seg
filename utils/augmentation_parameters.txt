@@ -1,0 +1,14 @@
+translation_bounds=0.0
+rotation_bounds=15
+shear_bounds=0.012
+scale_bounds=0.15
+max_elastic_displacement=0.15
+n_elastic_control_pts=3
+n_elastic_steps=0
+gamma_lower=-0.8
+gamma_upper=0.8
+shape=4
+v_max=1
+order=3
+sigma=1.00
+crop_patch_size=192
