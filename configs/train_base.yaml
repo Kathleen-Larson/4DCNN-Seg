@@ -1,0 +1,121 @@
+seed: 0
+
+augmentations:
+  AffineElasticTransform:
+    apply_affine: true
+    apply_elastic: true
+    elastic_factor: 0.0625
+    elastic_std: 3.0
+    n_elastic_steps: 7
+    randomize: true
+    rotations:
+    - -15.0
+    - 15.0
+    scales:
+    - -0.15
+    - 0.15
+    shears:
+    - -0.012
+    - 0.12
+    translations:
+    - 0.0
+    - 0.0
+  BiasField:
+    max_value: 1.0
+    randomize: True
+    shape_factor: 0.025
+    std: 0.3
+  CropPatch:
+    patch_sz: 96
+    randomize: true
+  FlipTransform:
+    chance: 0.5
+    flip_axis: 2
+  GammaTransform:
+    randomize: true
+    std: 0.5
+  GaussianNoise:
+    randomize: true
+    std: 21.0
+  MinMaxNorm:
+    min_int: 0.0
+    max_int: 1.0
+    min_perc: 0.0
+    max_perc: 0.95
+    use_robust: true
+
+dataloader:
+  batch_size: 1
+  num_workers: 8
+  pin_memory: true
+
+dataset:
+  input_data_config: 'configs/data/data_config__OAS1_samseg_44_talairach.csv'
+  lut: 'data/samseg44_labels.ctab'
+  n_splits: 3
+  randomize: false
+
+network:
+  activ_func_cnet: torch.nn.ELU
+  activ_func_unet: torch.nn.ELU
+  conv_sz_cnet: 3
+  conv_sz_unet: 3
+  drop_rate_cnet: 0
+  drop_rate_unet: 0
+  kernel_type_cnet: 'hypercube'
+  kernel_type_unet: 'hypercube'
+  n_convs_per_block_cnet: 2
+  n_convs_per_block_unet: 2
+  n_layers_cnet: 2
+  n_layers_unet: 2
+  n_levels: 3
+  n_starting_features: 24
+  norm_func_cnet: torch.nn.InstanceNorm
+  norm_func_unet: torch.nn.InstanceNorm
+  pool_type_cnet: 'conv'
+  pool_type_unet: 'conv'
+  pool_sz_cnet: 2
+  pool_sz_unet: 2
+  temporal: True
+  transfer_index: 2
+  use_residuals: false
+  use_skips: true
+
+optimizer:
+  _class: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.99
+  decay: 0.000001
+  lr_start: 0.0001
+  weight_decay: 0.000001
+
+synth:
+  include_lsns: True
+  lut: 'data/samseg44_labels.ctab'
+  max_perc_atrophy: -0.3
+  max_perc_lesion_growth: 0.5
+  model_config:
+    in_shape: 256
+    include_lsns: True
+    lsns_in:
+    - 2
+    - 41
+    lsns_label: 498
+    max_n_lsns: 10
+  slist_config: 'configs/structure_lists/synth.samseg44_labels.LR.yaml'
+
+
+training:
+  loss_funcs:
+  - loss_functions.mean_mse_loss_logits_yesbackground
+  - loss_functions.mean_dice_loss_yesbackground
+  lr_start: 0.0001
+  max_n_epochs: 200
+  max_n_steps: 100000
+  model_state_path:
+  output_dir: data/test
+  save_outputs_every: 0
+  start_aug_on: 0
+  steps_per_epoch: 2000
+  switch_loss_on: 0

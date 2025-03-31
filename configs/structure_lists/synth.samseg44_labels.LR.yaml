@@ -1,0 +1,32 @@
+Left:
+  Left-Accumbens-area:
+  - Left-Lateral-Ventricle
+  Left-Amygdala:
+  - Left-Lateral-Ventricle
+  - Left-Inf-Lat-Vent
+  Left-Caudate:
+  - Left-Lateral-Ventricle
+  Left-Cerebral-White-Matter:
+  - Left-Lateral-Ventricle
+  - Left-Inf-Lat-Vent
+  Left-Hippocampus:
+  - Left-Lateral-Ventricle
+  - Left-Inf-Lat-Vent
+  Left-Thalamus:
+  - Left-Lateral-Ventricle
+Right:
+  Right-Accumbens-area:
+  - Right-Lateral-Ventricle
+  Right-Amygdala:
+  - Right-Lateral-Ventricle
+  - Right-Inf-Lat-Vent
+  Right-Caudate:
+  - Right-Lateral-Ventricle
+  Right-Cerebral-White-Matter:
+  - Right-Lateral-Ventricle
+  - Right-Inf-Lat-Vent
+  Right-Hippocampus:
+  - Right-Lateral-Ventricle
+  - Right-Inf-Lat-Vent
+  Right-Thalamus:
+  - Right-Lateral-Ventricle
