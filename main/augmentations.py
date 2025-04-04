@@ -1,15 +1,16 @@
-import sys
+import sys, os
 import numpy as np
 from numpy import random as npr
 import math
 import random
+import surfa as sf
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import Compose
 
-from utils import unsqueeze_repeat, fatal
+import utils
 
 
 #-----------------------------------------------------------------------------#
@@ -18,7 +19,8 @@ from utils import unsqueeze_repeat, fatal
 
 class BiasField:
     """
-    Simulates bias field in input tensor [y = x * exp(B)]
+    Simulates bias field in input tensor [y = x * exp(B)]. Applies a different
+    field to each channel/timepoint
     """
     def __init__(self,
                  shape_factor:float=0.025,  # ratio of small field to img size
@@ -32,29 +34,26 @@ class BiasField:
         self.max_value = max_value
         self.randomize = randomize
         self.X = X
+        
             
     def _apply_bias_field(self, x):
-        sz_full = x.shape[-self.X:]
-        nB, nC, nT = x.shape[:self.X]
-        bf_full = torch.zeros(
-            ((nB, nC, nT) + sz_full), dtype=x.dtype, device=x.device
-        )
+        # Get shapes
+        _, nC, nT = x.shape[:-self.X]
+        sz_full = tuple(x.shape[-self.X:])
+        sz_small = (1, nC*nT) + resize_shape(sz_full, self.shape_factor)
         
-        for t in range(0, nT):
-            sz_small = torch.ceil(
-                torch.tensor(sz_full) * self.shape_factor
-            ).to(torch.int)
-            sz_small = (1, 1) + tuple(sz_small.tolist())
-            bf_std = random.uniform(0., self.std) if self.randomize \
-                else self.std
-            
-            bf_small = torch.normal(
-                mean=0., std=bf_std, size=tuple(sz_small), device=x.device
-            )
-            bf_full[:, :, t, ...] = F.interpolate(
-                bf_small, size=sz_full[-self.X:],
-                mode='trilinear' if self.X == 3 else 'bilinear'
-            )
+        # Create small-sized field for each timepoint/channel
+        bf_small = torch.normal(
+            mean=0., size=sz_small,
+            std=(self.std * random.random() if self.randomize else self.std)
+        ).to(x.device)
+        
+        # Resize to x.shape and apply
+        bf_full = F.interpolate(
+            bf_small, size=sz_full, align_corners=True,
+            mode='trilinear' if self.X == 3 else 'bilinear'
+        ).view(x.shape)
+        
         return x * torch.exp(bf_full)
 
         
@@ -63,6 +62,7 @@ class BiasField:
         return inputs
 
     
+#------------------------------------------------------------------------------
 
 class GammaTransform:
     """
@@ -71,23 +71,29 @@ class GammaTransform:
     def __init__(self,
                  std:float=0.5,        # std of gamma value
                  randomize:bool=True,  # flag to randomize
+                 X:int=3               # no. spatial dims
     ):
         self.std = std
         self.randomize = randomize
+        self.X = X
 
         
     def _gamma_transform(self, x):
-        gamma = torch.tensor(
-            random.normal(0., self.std) if self.randomize else self.std
+        # Apply to each channel/timepoint
+        torch.normal(
+            mean=0., size=x.shape,
+            std=(self.std * random.random() if self.randomize else self.std)
         ).to(x.device)
-        return x.pow(torch.exp(gamma))
 
+        return x.pow(torch.exp(gamma))
+    
     
     def __call__(self, inputs):
         inputs[0] = self._gamma_transform(inputs[0])
         return inputs
     
 
+#------------------------------------------------------------------------------
 
 class GaussianNoise:
     """
@@ -102,17 +108,21 @@ class GaussianNoise:
 
         
     def _noise(self, x):
-        noise_std = random.uniform(0., self.std) if self.randomize \
-            else self.std
-        noise = torch.normal(mean=0., std=noise_std, size=tuple(x.size()))
-        return x + noise.to(x.device)
+        # Apply to each channel/timepoint
+        noise = torch.normal(
+            mean=0., size=x.shape,
+            std=(self.std * random.random() if self.randomize else self.std)
+        ).to(x.device)
+        
+        return x + noise
 
 
     def __call__(self, inputs):
         inputs[0] = self._noise(inputs[0])
         return inputs
 
-    
+
+#------------------------------------------------------------------------------
 
 class MinMaxNorm:
     """
@@ -131,33 +141,28 @@ class MinMaxNorm:
         self.mperc = min_perc
         self.Mperc = max_perc
         self.use_robust = use_robust
+        self.X = X
         
         
-    def _min_max_norm(self, x, m=None, M=None):
-        m = self.m if m is None else m
-        M = self.M if M is None else N
-        return (M - m) * (x - x.min()) / (x.max() - x.min()) + m
-
-    
     def _robust_norm(self, x):
-        # Convert percentages to intensities
-        full_sz = x.shape
-        n_vox = np.prod([sz for sz in full_sz[:-self.X]])
-        flat_sz = shape[:-self.X] + (torch.tensor(n_vox,))
+        # Get shapes
+        full_sz = tuple(x.shape)
+        _, nC, nT = full_sz[:-self.X]
+        n_vox = np.prod(full_sz[-self.X:])
+        flat_sz = full_sz[:-self.X] + (n_vox,)
 
+        # Convert percentages to intensities
         x_sorted, _ = x.reshape(flat_sz).sort()
         m = x_sorted[..., max(int(self.mperc * flat_sz[-1]), 0)][0]
         M = x_sorted[..., min(int(self.Mperc * flat_sz[-1]), flat_sz[-1]-1)][0]
 
         # Robust normalization
-        _, nC, nT = full_sz[:-self.X]
         for c in range(nC):
             for t in range(nT):
-                m, M = [min_val[c, t], max_val[c, t]]
                 x[:, c, t, ...] = torch.clamp(
-                    x[:, chn, ...], min=m[c, t], max=M[c, t]
+                    x[:, c, t, ...], min=m[c, t], max=M[c, t]
                 )
-        return self._min_max_norm(x)
+        return utils._min_max_norm(x, m=self.m, M=self.M)
         
     
     def __call__(self, inputs):
@@ -165,12 +170,17 @@ class MinMaxNorm:
              else self._min_max_norm(inputs[0])
         return inputs
 
-
+    
 #-----------------------------------------------------------------------------#
 #                                Spatial funcs                                #
 #-----------------------------------------------------------------------------#
 
 class AffineElasticTransform:
+    """
+    Applies a spatial transform (affine + elastic) to an input tensor with 
+    dimensions [B, C, T, ...]. The same transform should be applied across all
+    channels, batches, and timepoints (unlike w/ the intensity augmentations).
+    """
     def __init__(self,
                  translations:[float,list]=0.0,  # translation bounds
                  rotations:[float,list]=15.0,    # rotation bounds (degrees)
@@ -187,7 +197,8 @@ class AffineElasticTransform:
         self.X = X
         self.apply_affine = apply_affine
         self.apply_elastic = apply_elastic
-
+        self.randomize = randomize
+        
         # Parse affine transform parameters
         if self.apply_affine:
             def _parse_affine_param(param, center=0.):
@@ -203,10 +214,10 @@ class AffineElasticTransform:
                 shift = torch.ones((self.X, 2), dtype=torch.float) * center
                 return torch.tensor(param).reshape(self.X, 2) + shift
 
-            self.translations = _parse_affine_param(translations)
-            self.rotations = _parse_affine_param(rotations)
-            self.shears = _parse_affine_param(shears, center=0.)
-            self.zooms = _parse_affine_param(scales, center=1.)
+            self.translation_bounds = _parse_affine_param(translations)
+            self.rotation_bounds = _parse_affine_param(rotations)
+            self.shear_bounds = _parse_affine_param(shears, center=0.)
+            self.scale_bounds = _parse_affine_param(scales, center=1.)
 
         # Parse elastic transform parameters
         if self.apply_elastic:
@@ -215,40 +226,44 @@ class AffineElasticTransform:
             self.n_elastic_steps = n_elastic_steps
 
 
-    def _make_affine(self, x, nT):
-        def _sample_params(bounds, nT):
+    def _AffineDisplacementField(self, x):
+        """
+        Randomly sample parameters (translations, rotations, shearing, and 
+        scaling) and generate affine transform
+        """
+        def _sample_params(bounds):
             bounds_range = torch.diff(bounds).squeeze()
-            return torch.rand((nT, self.X)) * bounds_range + bounds[:,0]
-        
-        I = utils.unsqueeze_repeat(
-            torch.eye(self.X+1, device=x.device),
-            unsqueeze_dims=0, repeats=(nT, 1, 1)
-        )
+            return torch.rand(self.X) * bounds_range + bounds[:,0]
+
+        n_vox = np.prod(tuple(x.shape[-self.X:]))
+        I = torch.eye(self.X+1)
 
         # Translations
         T = I.clone()
-        T[:, torch.arange(self.X), -1] = _sample_params(self.translations, nT)
+        T[torch.arange(self.X),-1] = _sample_params(self.translation_bounds)
 
         # Shears
-        Sinds = torch.ones(
-            (nT, self.X+1, self.X+1), dtype=torch.bool, device=x.device
-        )
-        Sinds[:, torch.eye(self.X+1, dtype=torch.bool)] = False
-        Sinds[:, -1, :] = False
-        Sinds[:, :, -1] = False
+        Sinds = torch.ones((self.X+1,self.X+1), dtype=torch.bool)
+        Sinds[torch.eye(self.X+1, dtype=torch.bool)] = False
+        Sinds[-1,:] = False
+        Sinds[:,-1] = False
+
         S = I.clone()
-        S[Sinds] = torch.cat([
-            _sample_params(self.shears, nT),_sample_params(self.shears, nT)
-        ], dim=-1).flatten()
+        S[Sinds] = torch.cat(
+            [_sample_params(self.shear_bounds),
+             _sample_params(self.shear_bounds)
+            ], dim=-1
+        )
         
         # Zooms
         Z = I.clone()
-        Z[:, torch.arange(self.X),
-          torch.arange(self.X)] = _sample_params(self.zooms, nT)
-        
+        Z[torch.arange(self.X),
+          torch.arange(self.X)] = _sample_params(self.scale_bounds)
+
         # Rotations
-        rotations = _sample_params(self.rotations, nT) * torch.pi/180
-        c, s = [torch.cos(r), torch.sin(r)]
+        rotations = _sample_params(self.rotation_bounds) * torch.pi/180
+        c, s = [torch.cos(rotations), torch.sin(rotations)]
+
         [R1, R2, R3] = [I.clone(), I.clone(), I.clone()]
         if self.X == 2:
             R1[torch.tensor([0,1,0,1]),
@@ -264,118 +279,122 @@ class AffineElasticTransform:
                )
             R3[torch.tensor([0,1,0,1]),
                torch.tensor([0,0,1,1])] = torch.tensor(
-                   [c[2], s[2], -s[2], c[2]]
-               )
-            
-        ## Convert affine matrix to displacement field
-        aff = (T @ R @ Z @ S).to(x.dtype).to(x.device)
+                   [c[2], s[2], -s[2], c[2]])
+
+        # Convert affine matrix to displacement field
+        aff = (T @ R3 @ R2 @ R1 @ Z @ S).to(x.device)
+        grid = self._meshgrid_coords(x)
+        coords = torch.cat(
+            [self._meshgrid_coords(x).view(-1, self.X),
+             torch.ones((n_vox, 1)).to(x.device)
+            ], dim=-1
+        )
+        coords_aff = coords @ aff.transpose(-2, -1)
+        grid_aff = coords_aff[..., :self.X].view(*x.shape[-self.X:], -1)
+        disp = grid_aff.unsqueeze(0) * (
+            2 / (torch.tensor(x.shape[-self.X:]) - 1).to(x.device)
+        )
+        return disp
+
+
+    def _ElasticDisplacementField(self, x):
+        """
+        Randomly generate an elastic deformation field
+        """
+        def _resize_shape(sz, mult):
+            return tuple(
+                torch.ceil(torch.tensor(sz) * mult).to(torch.int).tolist()
+            )
+
+        # Get field shapes
+        sz_full = tuple(x.shape[-self.X:])
+        sz_small = (1, self.X) + _resize_shape(sz_full, self.elastic_factor)
+        sz_half = (1, self.X) + _resize_shape(sz_full, 0.5)
+
+        # Create small sized SVF
+        std = (random.uniform(0, self.elastic_std) if self.randomize
+               else self.elastic_std
+        )
+        svf_small = torch.normal(mean=0., std=std, size=sz_small).to(x.device)
+
+        # Resize to half of full shape
+        svf_half =  F.interpolate(
+            svf_small, size=sz_half[-self.X:],
+            mode='trilinear' if self.X == 3 else 'bilinear'
+        )
+
+        # Integrate w/ scaling and squaring to smooth
+        svf_half /= (2 ** self.n_elastic_steps)
+        grid_half = self._meshgrid_coords(svf_half)
+
+        weights = 2 / (torch.tensor(sz_half[-self.X:])).to(x.device)
+
+        for _ in range(self.n_elastic_steps - 1):
+            grid_interp = weights * (svf_half.movedim(1, -1) + grid_half)
+            svf_half += F.grid_sample(
+                svf_half, grid_interp, align_corners=True, mode='bilinear'
+            )
+
+        # Interpolate to full size
+        elastic = F.interpolate(
+            svf_half, size=sz_full[-self.X:], align_corners=True,
+            mode='trilinear' if self.X == 3 else 'bilinear'
+        )
+        disp = elastic.movedim(1,-1) * (
+            2 / (torch.tensor(x.shape[-self.X:]) - 1).to(x.device)
+        )
+        return disp
+
+
+    def _meshgrid_coords(self, x):
+        """
+        Creates a meshgrid centered around origin for a tensor of
+        shape=x.size=[N, C, H, W, D]
+        """
         grid = torch.stack(
             torch.meshgrid(
-                [torch.arange(-(s-1)/2, s/2, dtype=x.dtype, device=x.device)
+                [torch.arange(0, s, dtype=x.dtype, device=x.device)
                  for s in x.shape[-self.X:]
                 ], indexing='ij'
             ), dim=-1
         )
-        coords = torch.cat(
-            [grid.view(-1, self.X), torch.ones(
-                (grid.numel()//self.X, 1), dtype=x.dtype, device=x.device)
-            ], dim=-1
-        )
-        aff_coords = (coords @ aff.transpose(-1,-2)).view(
-            nT, *x.shape[-self.X:], 4)
-                  
-        coords = (
-            torch.cat([grid.view(-1, self.X),
-                       torch.ones((grid.numel()//self.X,1), device=x.device)
-            ], dim=-1).to(x.device) @ aff.transpose(0,1)
-        ).view(*x.shape[-self.X:], self.X + 1)
-        
-        disp = 2 * aff_coords[..., :self.X] / (
-            torch.tensor(x.shape[-self.X:], device=x.device) - 1
-        )
-        return disp
-
-    
-    def _make_elastic(self, x, nT):
-        f = self.elastic_factor
-        n = self.n_elastic_steps
-
-        # Field shapes
-        sz_full = x.shape[-self.X:]
-        sz_small = (1, 1) + tuple(torch.ceil(torch.tensor(sz_full) * f
-        ).to(torch.int).tolist()) + (self.X,)
-        sz_half = (1, 1) + tuple(torch.ceil(torch.tensor(sz_full) * 0.5
-        ).to(torch.int).tolist()) + (self.X,)
-
-        elastic = torch.zeros((x.shape[1:] + (self.X,)), dtype=x.dtype
-        ).to(x.device)
-
-        for t in range(nT):
-            # Create SVF
-            svf_small = torch.normal(
-                mean=0., std=torch.rand(1).item(), size=tuple(sz_small)
-            ).to(x.device)
-            svf_half =  torch.stack([
-                F.interpolate(svf_small[...,i],
-                              size=tuple(sz_half[-self.X-1:-1]),
-                              mode='trilinear' if self.X == 3 else 'bilinear'
-                ) for i in range(self.X)], dim=-1
-            )
-            
-            # Scaling and squaring
-            svf_half = (svf_half / (2 ** self.n_elastic_steps)
-            ).squeeze(1).movedim(-1,1)
-            grid_half = torch.stack(
-                torch.meshgrid(
-                    [torch.arange(s, dtype=svf_half.dtype, device=x.device)
-                     for s in svf_half.shape[-self.X:]
-                    ], indexing='ij'
-                ), dim=-1
-            ).movedim(-1,0).unsqueeze(0)
-            weights = (2 / torch.tensor(grid_half.shape[-self.X:])
-            ).to(x.device)
-            
-            for _ in range(n - 1):
-                grid_interp = (svf_half + grid_half).movedim(1,-1) * weights
-                svf_half += F.grid_sample(
-                    svf_half, grid_interp, align_corners=True
-                )
-
-            # Interpolate to full size
-            elastic[:, t, ...] = F.interpolate(
-                svf_half, size=sz_full[-self.X:],
-                align_corners=True, mode='trilinear'
-            ).movedim(1,-1)
-
-        return elastic
+        grid -= ((grid.max() - grid.min()) / 2.)
+        return grid
 
 
     def __call__(self, inputs):
-        _, _, nT = inputs[0].shape[:-self.X]
-
-        if self.apply_affine and self.apply_elastic:
-            A = self._make_affine(inputs[0]).unsqueeze(0)
-            E = self._make_elastic(inputs[0])
-            T = A + E
-        elif self.apply_affine:
-            T = self._make_affine(inputs[0]).unsqueeze(0)
-        elif self.apply_elastic:
-            T = self._make_elastic(inputs[0])
-        else:
+        """
+        """
+        # Generate affine and elastic displacement fields
+        A = (self._AffineDisplacementField(inputs[0]) if self.apply_affine
+             else None)
+        E = (self._ElasticDisplacementField(inputs[0]) if self.apply_elastic
+             else None)
+        A = None
+        # Compose into single transform
+        if A is None and E is None:
             T = None
+        elif A is not None and E is not None:
+            T = A + E
+        else:
+            T = E + self._meshgrid_coords(inputs[0]) * (
+                2 / torch.tensor(inputs[0].shape[-self.X:])
+            ).to(inputs[0].device) if A is None else A
 
-        for t in range(nT):            
-            inputs = inputs if T is not None else [
-                F.grid_sample(
-                    x[:,:,t,...], T[:,t,...].permute(0, 3, 2, 1, 4),
-                    align_corners=True, mode='bilinear'
-                ) for x in inputs
-            ]
-                       
+        # Apply to each input
+        for n, x in enumerate(inputs):
+            sz = x.shape
+            nB, nC, nT = sz[:-self.X]
+            inputs[n] = F.grid_sample(
+                x.view((nB, nC*nT) + sz[-self.X:]), T.permute(0, 3, 2, 1, 4),
+                align_corners=True, mode='bilinear'
+            ).view(sz)
+
         return inputs
 
     
-
+#------------------------------------------------------------------------------
+    
 class CropPatch:
     def __init__(self,
                  patch_sz:[int, list]=None,  # size of crop patch
@@ -386,29 +405,16 @@ class CropPatch:
         self.patch_sz = [patch_sz] * X if isinstance(patch_sz, int)\
             else patch_sz
         
-        if self.patch_sz is not None:
-            if randomize:
-                self._get_bounds = self._get_random_crop_bounds
-            else:
-                self._get_bounds = self._get_center_crop_bounds
-
-                
-    def _get_bounding_box(self, vol, bffr:int=4):
-        vol = torch.squeeze(vol)
-        bbox = [[0, vol.shape[i]-1] for i in range(len(vol.shape))]
-
-        while vol[bbox[0][0],:,:].sum() == 0: bbox[0][0] += 1
-        while vol[bbox[0][1],:,:].sum() == 0: bbox[0][1] -= 1
-        while vol[:,bbox[1][0],:].sum() == 0: bbox[1][0] += 1
-        while vol[:,bbox[1][1],:].sum() == 0: bbox[1][1] -= 1
-        while vol[:,:,bbox[2][0]].sum() == 0: bbox[2][0] += 1
-        while vol[:,:,bbox[2][1]].sum() == 0: bbox[2][1] -= 1
-
-        bbox = [[bb[0] - (bffr), bb[1] + (bffr)] for bb in bbox]
-        return bbox
+        self._get_bounds = (
+            self._get_random_crop_bounds if randomize
+            else self._get_center_crop_bounds
+        )
 
 
     def _get_center_crop_bounds(self, vol_sz, bbox:list=None):
+        """
+        Get bounds of crop window centered within input image
+        """
         vol_sz = vol_sz[-self.X:]
         patch_sz = self.patch_sz
 
@@ -428,7 +434,11 @@ class CropPatch:
 
 
     def _get_random_crop_bounds(self, vol_sz, bbox:list=None,
-                                return_bounds=False):
+                                return_bounds=False
+    ):
+        """
+        Get bounds of randomly placed crop window within input image
+        """
         vol_sz = vol_sz[-self.X:]
         patch_sz = self.patch_sz
 
@@ -439,7 +449,9 @@ class CropPatch:
                 for i in range(self.X)
             ]
         else:
-            rand_bounds = [[0, vol_sz[i] - patch_sz[i]] for i in range(self.X)]
+            rand_bounds = [
+                [0, vol_sz[i] - patch_sz[i]] for i in range(self.X)
+            ]
 
         start_idx = [
             rand_bounds[i][1] if rand_bounds[i][1] <= rand_bounds[i][0]
@@ -449,11 +461,14 @@ class CropPatch:
         bounds = [
             (start_idx[i], start_idx[i] + patch_sz[i]) for i in range(self.X)
         ]
-
         return bounds
     
 
     def _apply_crop(self, vol, bounds):
+        """
+        Extract patch of input volume within bounds (same bounds for all 
+        channels/timepoints)
+        """
         if self.X == 2:
             h, w = bounds
             crop = vol[..., h[0]:h[1], w[0]:w[1]]
@@ -464,7 +479,7 @@ class CropPatch:
             print(f'Invalid X (X=={self.X}')
 
         return crop
-
+        
     
     def __call__(self, inputs, return_bounds=False):
         if self.patch_sz is not None:
@@ -475,8 +490,12 @@ class CropPatch:
         return inputs
 
 
+#------------------------------------------------------------------------------
 
 class FlipTransform:
+    """
+    Flips input image across left/right axis
+    """
     def __init__(self,
                  flip_axis:int=None, # axis to flip
                  chance:float=0.5,   # probability of flipping
@@ -486,20 +505,22 @@ class FlipTransform:
         self.chance = chance \
             if (chance <= 1 and chance >= 0) or chance is not None \
                else fatal('Invalid chance (must be float between 0 and 1)')
+        self.flip_axis = flip_axis
+        """
         self.flip_axis = flip_axis \
             if isinstance(flip_axis, int) or flip_axis is None \
                else fatal('Invalid flip_axis (must be int between 0 and '
                           'number of spatial dimensions)')
-
+        """
+        
     def __call__(self, inputs):
         if torch.rand((1)) < self.chance:
-            inputs = [torch.fliplr(
-                x.transpose(1,self.flip_axis)
-            ).transpose(1,self.flip_axis) for x in inputs]
+            axis = self.flip_axis + 3
+            inputs = [torch.flip(x, dims=[axis]) for x in inputs]
         return inputs
+    
 
-
-
+    
 #-----------------------------------------------------------------------------#
 #                                  Misc funcs                                 #
 #-----------------------------------------------------------------------------#
@@ -538,16 +559,62 @@ class AssignOneHotLabels:
         return inputs
 
 
+#------------------------------------------------------------------------------
 
 class ComposeTransforms:
+    """
+    Sequentially applies a list of transform classes to a list of input tensors
+    """
     def __init__(self, transform_list):
         self.transforms = [t for t in transform_list if t is not None]
         
     def __call__(self, inputs):
         for T in self.transforms:
             if T is not None:
-                inputs = T(inputs)
+                inputs = T(
+                    inputs if isinstance(inputs, list) else list(inputs)
+                )
         return inputs
 
 
+#------------------------------------------------------------------------------
 
+def resize_shape(sz, mult):
+    """
+    Multiplies input size (tuple) and returns new size as tuple
+    """
+    return tuple(
+        torch.ceil(torch.tensor(sz) * mult).to(torch.int).tolist()
+    )
+
+
+def visualize(x):
+    """
+    Visualize an input tensor image w/ Freeview
+    """
+    img = x.cpu().numpy().squeeze(0)
+    fv = sf.vis.Freeview()
+    for chn in range(img.shape[0]):
+        fv.add_image(img[0, ...])
+    fv.show()
+
+
+def write(xlist, basenames,
+          is_labels:list[bool]=[False],
+          is_onehot:list[bool]=[False],
+          n_dims:int=3
+):
+    """
+    Write outputs of augmentation functions
+    """
+    for n, (x, fbase) in enumerate(zip(xlist, basenames)):
+        x = torch.argmax(x, dim=1).unsqueeze(1) if is_onehot[n] else x
+
+        if len(x.squeeze(0).squeeze(0).shape) == n_dims + 1:
+            x = x.squeeze(0).squeeze(0).cpu().numpy().astype(
+                np.int32 if is_labels[n] else np.float32
+            )
+            for t in range(x.shape[0]):
+                img = sf.Volume(x[t, ...]).save(f'{fbase}.{t}.mgz')
+        else:
+            print(f'not yet implemented, cannot write {fbase}')
