@@ -60,7 +60,7 @@ class SynthLongitudinal(nn.Module):
             ) if max_n_lsns > 0 else nn.Identity()
 
             resize_labels = _ResizeLabels(
-                sdict=sdict, subsample=subsample_atrophy,
+                sdict=sdict, subsample=subsample,
                 in_shape=in_shape, device=device
             ) if sdict is not None and t > 0 else nn.Identity()
 
@@ -312,7 +312,7 @@ class _ResizeLabels(nn.Module):
         the sdict (allows for randomization beyond class initialization)
         """
         # Get idxs of structures to atrophy
-        n_atrophy = random.randint(0, len(self.sdict))
+        n_atrophy = random.randint(1, len(self.sdict))
         idxs_all = torch.arange(0, len(self.sdict))
         idxs = torch.multinomial(idxs_all.to(torch.float), n_atrophy)
 
@@ -411,7 +411,7 @@ class _LabelsToImage(nn.Module):
         X = self._synthesize_intensities(X)
         X = self._add_noise(X)
         X = self.gaussian_blur(X)
-        X = utils._min_max_norm(X, m=0, M=255)
+        X = utils.min_max_norm(X, m=0, M=255)
         return X
 
     

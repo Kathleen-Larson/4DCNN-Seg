@@ -25,7 +25,7 @@ class SynthDataset(Dataset):
                  image_files:list,
                  aug_config:dict=None,
                  n_input:int=1,
-                 n_class:int=1,
+                 n_class:int=None,
                  n_timepoint:int=2,
                  lut=None,
                  X:int=3,
@@ -48,24 +48,40 @@ class SynthDataset(Dataset):
                          for fname in self.input_files]
 
         # Set up data augmentations
-        self.augmentations = aug.ComposeTransforms(
-            [None if lut is None
-             else aug.AssignOneHotLabels(label_values=[x for x in lut])
-            ] + [getattr(aug, func)(**aug_config[func]) for func in aug_config]
-        )
+        aug_list = [
+            None if lut is None
+            else aug.AssignOneHotLabels(label_values=[x for x in lut])
+        ]
+        aug_list += [getattr(aug, func)(**aug_config[func])
+                     for func in aug_config['_transform_order']
+                     if func in aug_config
+        ]
+        self.augmentations = aug.ComposeTransforms(aug_list)
 
         
     def __len__(self) -> int:
         return int(len(self.input_files))
 
+    
     def __n_input__(self) -> int:
         return self.n_input
 
+    
     def __n_class__(self) -> int:
         return self.n_class
-        
-    def _save_volume(self, img, path, idx, is_labels=False):
-        utils.save_volume(img, path, label_lut=self.lut, is_labels=is_labels)
+
+    
+    def _save_volume(self, img, outdir, outbase, idx,
+                     is_labels=False, is_onehot=False, rescale=True,
+    ):
+        img = img.softmax(dim=1) if is_onehot else img
+        inbase, ext = os.path.splitext(os.path.basename(self.input_files[idx]))
+        path = os.path.join(outdir, inbase, outbase + ext)
+        utils.save_volume(
+            img, path, label_lut=self.lut,
+            is_labels=is_labels, rescale=rescale
+        )
+
         
     def __getitem__(self, idx, gpu=True, cpu=False):
         inpath = self.input_files[idx]
@@ -75,8 +91,13 @@ class SynthDataset(Dataset):
 
 #------------------------------------------------------------------------------
 
-def _config_datasets(data_config:dict, aug_config:dict,
-                     infer_only:bool=False, device=None,
+def _config_datasets(data_config:dict,
+                     aug_config:dict,
+                     device=None,
+                     infer_only:bool=False,
+                     n_splits:int=3,
+                     randomize:bool=False,
+                     split_ratio:float=0.2,
 ):
     # Load label lut
     if not 'lut' in data_config:
@@ -92,20 +113,25 @@ def _config_datasets(data_config:dict, aug_config:dict,
     n_images = len(image_files)
         
     # Split images into separate cohorts (e.g. train/valid/test)
-    n_splits = 1 if infer_only else data_config['n_splits']
-    data_split_names = (['test'] if infer_only
-                        else ['train', 'test', 'valid'][:n_splits]
+    n_splits = n_splits if infer_only else data_config['n_splits']
+    data_split_names = (
+        ['test'] if infer_only else ['train', 'test', 'valid'][:n_splits]
     )
     if infer_only:
         idxs_lists = [np.arange(0, image_files.shape[0]).tolist()]
     else:
         random.shuffle(image_files)
-        x = int(0.2 * n_images)
+        split_ratio = (
+            data_config['split_ratio']
+            if utils.check_config(data_config, 'split_ratio') else split_ratio
+        )
+        x = int(split_ratio * n_images)
         split_idxs = [0] + [
             n_images - (j+1) * x for j in reversed(range(n_splits-1))
         ] + [n_images]
-        idxs_lists = [np.arange(split_idxs[n], split_idxs[n+1]).tolist()
-                      for n in range(n_splits)
+        idxs_lists = [
+            np.arange(split_idxs[n], split_idxs[n+1]).tolist()
+            for n in range(n_splits)
         ]
 
     # Initialize torch dataset for each cohort

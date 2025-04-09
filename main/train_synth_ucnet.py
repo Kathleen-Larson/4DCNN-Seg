@@ -16,12 +16,11 @@ import torch.nn as nn
 import torch.optim
 from torch.utils.data import DataLoader, RandomSampler
 
-#import segmenter
 from synth_dataset import _config_datasets
 from generate_atrophy import _config_synth_models
 import utils
-from unet4d_classifier import UClassNetXD_Longitudinal
-from segmenter import SynthAtrophySegmenter
+from unet4d_classifier import UClassNetXD_Long as UClassNetXD
+from segmenter_synth_ucnet import SynthUCNetSegmenter
 
 #------------------------------------------------------------------------------
 
@@ -60,8 +59,7 @@ def main(pargs):
         device=device,
     )
     if 'train' in datasets:
-        if ('steps_per_epoch' in config['training']
-            and config['training']['steps_per_epoch'] is None):
+        if utils.check_config(config['training'], 'steps_per_epoch'):
             n_train_samples = len(datasets['train'])
             config['training']['steps_per_epoch'] = n_train_samples
         else:
@@ -85,7 +83,7 @@ def main(pargs):
         )
 
     # Initialize segmentation model + optimizer
-    network = UClassNetXD_Longitudinal(
+    network = UClassNetXD(
         in_channels=datasets['test'].__n_input__(),
         out_channels_unet=datasets['test'].__n_class__(),
         out_channels_cnet=len(synth_models),
@@ -94,7 +92,7 @@ def main(pargs):
     optimizer = _config_optimizer(network.parameters(), **config['optimizer'])
 
     # Configure segmenter
-    segmenter = SynthAtrophySegmenter(
+    segmenter = SynthUCNetSegmenter(
         synth=synth_models,
         model=network,
         optimizer=optimizer,
@@ -120,12 +118,12 @@ def main(pargs):
         if not 'train' in loaders:
             utils.fatal('No train loader exists... something went wrong')
         segmenter._train(loader=loaders['train'])
-
+        """
         if 'valid' in loaders:
             segmenter._predict(loader=loaders['valid'], loss_type='valid')
-
+        """
         segmenter._epoch_end()
-
+    
     # Run inference
     if 'test' in loaders:
         segmenter._predict(

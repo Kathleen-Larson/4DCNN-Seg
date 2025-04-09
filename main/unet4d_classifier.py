@@ -10,9 +10,9 @@ import utils
 
 #------------------------------------------------------------------------------
 
-class UClassNetXD_Longitudinal(nn.Module):
+class UClassNetXD_Long(nn.Module):
     """
-    Main class for the unet+classifier change detection network.
+    Joint unet+classifier change detection network.
     
     Required inputs:
     - in_channels:        no. input channels (most likely image modalities)
@@ -24,6 +24,8 @@ class UClassNetXD_Longitudinal(nn.Module):
     - n_levels:             number of unet/cnet levels
     - n_starting_features:  number of features at highest spatial res.
     - transfer_index:       index of unet decoder output for cnet input 
+    - use_only_cnet:        flag to use only cnet component of UClassNetXD
+    - use_only_unet:        flag to use only unet component of UClassNetXD
     - T:                    index of temporal dimension in input image
     - X:                    number of spatial dimensions in input image
     
@@ -56,8 +58,8 @@ class UClassNetXD_Longitudinal(nn.Module):
                  out_channels_unet:int,
                  activ_func_cnet:str='ReLU',
                  activ_func_unet:str='ReLU',
-                 conv_kernel_size_cnet:int=3,
-                 conv_kernel_size_unet:int=3,
+                 conv_kernel_size_cnet:list[int]=3,
+                 conv_kernel_size_unet:list[int]=3,
                  conv_shape_cnet:str='hypercube',
                  conv_shape_unet:str='hypercube',
                  dropout_rate_cnet:float=0.,
@@ -69,58 +71,26 @@ class UClassNetXD_Longitudinal(nn.Module):
                  n_starting_features:int=24,
                  norm_func_cnet:str='Instance',
                  norm_func_unet:str='Instance',
-                 sample_func_down_cnet:str='_DownSample',
-                 sample_func_down_unet:str='_DownSample',
-                 sample_func_up_unet:str='_UpSample',
-                 sample_kernel_size_cnet:int=2,
-                 sample_kernel_size_unet:int=2,
+                 sample_func_down_cnet:str='_DownConv',
+                 sample_func_down_unet:str='_DownConv',
+                 sample_func_up_unet:str='_UpConv',
+                 sample_kernel_size_cnet:list[int]=2,
+                 sample_kernel_size_unet:list[int]=2,
                  transfer_index:int=2,
+                 use_only_cnet:bool=False,
+                 use_only_unet:bool=False,
                  use_residuals:bool=False,
                  use_skips:bool=True,
                  use_temporal:str=True,
+                 use_unet_only:bool=False,
                  T:int=2,
                  X:int=3,
     ):
-        super(UClassNetXD_Longitudinal, self).__init__()
+        super(UClassNetXD_Long, self).__init__()
         
-        # Within-class utilities to parse args 
-        def _print_arg_error(instr:str):
-            utils.fatal(
-                f'Error in UClassNetXD_Longitudinal.__init__: {instr}'
-            )
-
-        def _arg_to_list(arg, dtype):
-            arg = (
-                [arg] * (self.X + 1) if isinstance(arg, dtype)
-                else [x for x in arg]
-            )
-            varname = f'{arg=}'.split('=')[0]
-            return arg if len(arg) == (self.X + 1) else _print_arg_error(
-                f'{varname} must be {dtype} or list/tuple of {dtype} of '
-                f'len=={self.X+1} (input was {arg})'
-            )
-
-        def _get_function(arg):
-            try:
-                return eval(f'{arg}')
-            except:
-                try:
-                    return eval(f'{arg}{self.X}d')
-                except:
-                    varname = f'{arg=}'.split('=')[0]
-                    _print_arg_error(
-                        f'{arg} (or {arg}{self.X}d) is not a valid input for '
-                        f'{varname} (not a valid callable function)'
-                    )
-
-        def _valid_configured_input(arg, valid_list):
-            if arg not in valid_list:
-                varname = f'{arg=}'.split('=')[0]
-                _print_arg_error(
-                    f'{arg} not a valid input for {varname} (must be in '
-                    f'{valid_list})')
-            
         # Parse class attributes
+        self.do_cnet = True if not use_only_unet else False
+        self.do_unet = True if not use_only_cnet else False
         self.use_residuals = use_residuals
         self.use_skips = use_skips
         self.use_temporal = use_temporal
@@ -129,200 +99,230 @@ class UClassNetXD_Longitudinal(nn.Module):
         self.X = X
 
         feature_config = [
-            n_starting_features * (feature_ratio ** n) for n in range(n_levels)
+            int(n_starting_features * (feature_ratio ** n))
+            for n in range(n_levels)
         ]
-        self.n_blocks = n_levels
+        self.n_levels = n_levels
         
-        # Make sure other args are correct type/shape
-        activ_func_cnet = _get_function(activ_func_cnet)
-        activ_func_unet = _get_function(activ_func_unet)
+        # Functions (activation, normalization, sampling)
+        activ_func_cnet = _parse_arg_as_function(self, activ_func_cnet)
+        activ_func_unet = _parse_arg_as_function(self, activ_func_unet)
 
-        conv_kernel_size_cnet = _arg_to_list(conv_kernel_size_cnet, int)
-        conv_kernel_size_unet = _arg_to_list(conv_kernel_size_unet, int)
+        norm_func_cnet = _parse_arg_as_function(self, norm_func_cnet)
+        norm_func_unet = _parse_arg_as_function(self, norm_func_unet)
 
-        norm_func_cnet = _get_function(norm_func_cnet)
-        norm_func_unet = _get_function(norm_func_unet)
+        sample_func_down_cnet = _parse_arg_as_function(
+            self, sample_func_down_cnet)
+        sample_func_down_unet = _parse_arg_as_function(
+            self, sample_func_down_unet)
+        sample_func_up_unet = _parse_arg_as_function(
+            self, sample_func_up_unet)
 
-        sample_func_down_cnet = _get_function(sample_func_down_cnet)
-        sample_func_down_unet = _get_function(sample_func_down_unet)
-        sample_func_up_unet = _get_function(sample_func_up_unet)
-
-        sample_kernel_size_cnet = _arg_to_list(sample_kernel_size_cnet, int)
-        sample_kernel_size_unet = _arg_to_list(sample_kernel_size_unet, int)
+        sample_kernel_size_cnet = _parse_arg_as_list(
+            self, sample_kernel_size_cnet, int)
+        sample_kernel_size_unet = _parse_arg_as_list(
+            self, sample_kernel_size_unet, int)
         
-        valid_conv_shapes = ['hypercube', 'hypercross']
-        conv_shape_cnet = (
-            conv_shape_cnet if conv_shape_cnet in valid_conv_shapes
-            else _print_arg_error(
-                    f'{conv_shape_cnet} not a valid input for conv_shape_cnet '
-                    f'(must be in {valid_conv_shapes})')
-        )
-        conv_shape_unet = (
-            conv_shape_unet if conv_shape_cnet in valid_conv_shapes
-            else _print_arg_error(
-                    f'{conv_shape_unet} not a valid input for conv_shape_unet '
-                    f'(must be in {valid_conv_shapes})')
-        )
+        # Convolution kernels
+        conv_shapes = ['hypercube', 'hypercross']
+        conv_shape_cnet = _valid_configured_input(
+            self, conv_shape_cnet, conv_shapes)
+        conv_shape_unet = _valid_configured_input(
+            self, conv_shape_unet, conv_shapes)
+        
+        conv_kernel_size_cnet = _parse_arg_as_list(
+            self, conv_kernel_size_cnet, int)
+        conv_kernel_size_unet = _parse_arg_as_list(
+            self, conv_kernel_size_unet, int)
+           
+        # Build unet
+        if self.do_unet:
+            # Encoding blocks
+            self.encoder = nn.Module()
+            unet_enc_config = [in_channels] + feature_config
+
+            for n in range(self.n_levels):
+                block_config = (
+                    [unet_enc_config[n]]
+                    + [unet_enc_config[n+1]] * n_convs_per_block_unet
+                )
+                convblock = _UNetBlock(
+                    activ_func=activ_func_unet,
+                    conv_size=conv_kernel_size_unet,
+                    conv_shape=conv_shape_unet,
+                    dropout_rate=dropout_rate_unet,
+                    feature_config=block_config,
+                    norm_func=norm_func_unet,
+                    temporal=self.use_temporal,
+                    X=self.X,
+                    T=self.T
+                )
+                downsample = sample_func_down_unet(
+                    n_features=block_config[-1],
+                    sampling_factor=sample_kernel_size_unet,
+                    temporal=False,
+                    X=self.X,
+                    T=self.T,
+                )
+                self.encoder.add_module(f'ConvBlock{n+1}', convblock)
+                self.encoder.add_module(f'Downsample{n+1}', downsample)
+
+            # Decoding blocks
+            self.decoder = nn.Module()
+            unet_dec_config = [out_channels_unet] + feature_config            
+
+            for n in reversed(range(self.n_levels)):
+                block_config = (
+                    [unet_dec_config[n+1]] * n_convs_per_block_unet
+                    + [unet_dec_config[n]]
+                )
+                upsample = sample_func_up_unet(
+                    n_features=block_config[0],
+                    sampling_factor=sample_kernel_size_unet,
+                    temporal=False,
+                    X=self.X,
+                    T=self.T,
+                )
+                convblock = _UNetBlock(
+                    activ_func=activ_func_unet,
+                    conv_size=conv_kernel_size_unet,
+                    conv_shape=conv_shape_unet,
+                    dropout_rate=dropout_rate_unet,
+                    feature_config=block_config,
+                    norm_func=norm_func_unet,
+                    temporal=self.use_temporal,
+                    skip=self.use_skips,
+                    X=self.X,
+                    T=self.T
+                )
+                self.decoder.add_module(f'Upsample{n+1}', upsample)
+                self.decoder.add_module(f'ConvBlock{n+1}', convblock)
                 
-        # UNet encoding arm:
-        self.unet_encoder = nn.Sequential()
-        unet_enc_config = [in_channels] + feature_config
-        
-        for b in range(self.n_blocks):
-            block_config = (
-                [unet_enc_config[b]]
-                + [unet_enc_config[b+1]] * n_convs_per_block_unet
-            )
-            convblock = _UNetBlock(
-                activ_func=activ_func_unet,
-                conv_size=conv_kernel_size_unet,
-                conv_shape=conv_shape_unet,
-                dropout_rate=dropout_rate_unet,
-                feature_config=block_config,
-                norm_func=norm_func_unet,
-                temporal=self.use_temporal,
-                X=self.X,
-                T=self.T
-            )
-            downsample = sample_func_down_unet(
-                n_features=block_config[-1],
-                sampling_factor=sample_kernel_size_unet,
-                temporal=False,
-                X=self.X,
-                T=self.T,
-            )
-            self.unet_encoder.add_module(f'ConvBlock{b+1}', convblock)
-            self.unet_encoder.add_module(f'Downsample{b+1}', downsample)
-                            
-        # UNet decoding arm:
-        self.unet_decoder = nn.Sequential()
-        unet_dec_config = [out_channels_unet] + feature_config
-        
-        for b in reversed(range(self.n_blocks)):
-            block_config = (
-                [unet_dec_config[b+1]] * n_convs_per_block_unet
-                + [unet_dec_config[b]]
-            )
-            upsample = sample_func_up_unet(
-                n_features=block_config[0],
-                sampling_factor=sample_kernel_size_unet,
-                temporal=False,
-                X=self.X,
-                T=self.T,
-            )
-            convblock = _UNetBlockTranspose(
-                activ_func=activ_func_unet,
-                conv_size=conv_kernel_size_unet,
-                conv_shape=conv_shape_unet,
-                dropout_rate=dropout_rate_unet,
-                feature_config=block_config,
-                norm_func=norm_func_unet,
-                temporal=self.use_temporal,
-                skip=self.use_skips,
-                X=self.X,
-                T=self.T
-            )
-            self.unet_decoder.add_module(f'Upsample{b+1}', upsample)
-            self.unet_decoder.add_module(f'ConvBlock{b+1}', convblock)
+                
+        # Build classifier arm
+        if self.do_cnet:
+            self.classifier = nn.Module()
+            cnet_input_feature_config = unet_dec_config[1:]
 
-        # Classifier arm
-        self.classifier = nn.Sequential()
-        n_cnet_features = torch.tensor(cnet_feature_config).sum().item()
-        cnet_input_feature_config = unet_dec_config[1:]
-        cnet_output_feature_config = (
-            [n_cnet_features] * n_convs_per_block_cnet + out_channels_unet
-        )        
+            # Downsampling
+            for b in range(self.n_levels):
+                spatial_downsample = _CNetSpatialDownBlock(
+                    n_features=cnet_input_feature_config[b],
+                    sampling_func=sample_func_down_cnet,
+                    sampling_factor=sample_kernel_size_unet,
+                    X=self.X,
+                    T=self.T
+                )
+                temporal_downsample = _CNetTemporalDownBlock(
+                    n_features=cnet_input_feature_config[b],
+                    sampling_factor=sample_kernel_size_cnet[0],
+                    T=self.T,
+                )
+                self.classifier.add_module(
+                    f'Downsample{b+1}', nn.Sequential(
+                        spatial_downsample, temporal_downsample
+                    )
+                )
 
-        ## TO-DO: write these functions
-        
-        for b in range(self.n_blocks):
-            spatial_downsample = _CNetSpatialDownBlock(
-                n_features=classifier_config[b],
-                sampling_func=sample_func_down_cnet,
-                sampling_factor=sample_kernel_size_unet,
-                X=self.X,
-                T=self.T,
+            # Final linear functions
+            n_cnet_features = torch.tensor(
+                cnet_input_feature_config).sum().item()
+            cnet_output_feature_config = (
+                [n_cnet_features] * n_convs_per_block_cnet
+                + [out_channels_cnet]
             )
-            temporal_downsample = _CNetTemporalDownBlock(
-                n_features=classifier_config[b],
-                sampling_func=sample_func_down_cnet,
-                sampling_factor=sample_kernel_size_unet,
-                X=self.X,
-                T=self.T,
+            final_block = _CNetFinalBlock(
+                feature_config=cnet_output_feature_config,
+                activ_func=activ_func_cnet,
+                conv_size=conv_kernel_size_cnet[0],
             )
-            self.classifier.add_module(
-                f'SpatialBlock{b+1}', spatial_downsample
-            )
-            self.classifier.add_module(
-                f'TemporalBlock{b+1}', spatial_downsample
-            )
-        final_block = _CNetFinalBlock(
-            feature_config=cnet_output_feature_config
-            activ_func=activ_func_cnet,
-            conv_size=conv_kernel_size_cnet,
-            dropout_rate=dropout_rate_cnet,
-            norm_func=norm_func_cnet
-        )
-        self.classifier.add_module('FinalConvBlock', final_block)
+            self.classifier.add_module('FinalConvBlock', final_block)
 
-        
-    ###
+
+    # Forward call
     def forward(self, x):
-        def _squeeze_spatial(x):
-            while x.shape[-1] == 1:
-                x = torch.squeeze(x, dim=-1)
-            return x
+        enc = [None] * (self.n_levels) # encoding level outputs
+        dec = [None] * (self.n_levels) # decoding level outputs
+        cls = [None] * (self.n_levels) # inputs to classifer
+        siz = [None] * (self.n_levels) # maxunpool output size
 
-        def _restore_dims(x, nD):
-            while len(x.shape) != nD:
-                x = torch.unsqueeze(x, dim=-1)
-            return x
-
-        # Storage
-        enc = [None] * (self.n_blocks) # encoding level outputs
-        dec = [None] * (self.n_blocks) # decoding level outputs
-        cls = [None] * (self.n_blocks) # inputs to classifer
-        siz = [None] * (self.n_blocks) # maxunpool output size
+        # U-Net
+        if self.do_unet:
+            for n in range(self.n_levels):
+                out = self.encoder.__getattr__(f'ConvBlock{n+1}')(x)
+                x = enc[n] = out[-1]
+                siz[n] = enc[n].shape
                 
-        # U-Net (encoding)
-        for b in range(self.n_blocks):
-            out = self.unet_encoder.__getattr__(f'ConvBlock{b+1}')(x)
-            x = enc[b] = out[-1]
-            siz[b] = enc[b].shape
-
-            if b != self.n_blocks - 1:
-                x = self.unet_encoder.__getattr__(f'Downsample{b+1}')(x)
-
-        # U-Net (decoding)
-        for b in reversed(range(self.n_blocks)):
-            if b != self.n_blocks - 1:
-                x = self.unet_decoder.__getattr__(f'Upsample{b+1}')(x, siz[b])
-                out = self.unet_decoder.__getattr__(f'ConvBlock{b+1}')(
-                    torch.cat([x, enc[b]], dim=1)
-                )
-            x = dec[b] = out[-1]
-            cls[b] = out[-(self.L)]
+                if n != self.n_levels - 1:
+                    x = self.encoder.__getattr__(f'Downsample{n+1}')(x)
             
-        # Classifier
-        """
-        for b in range(self.n_blocks):
-            sampling_kernel = self.classifier
-            while cls[b].shape[-self.X:] != (1,) * self.X:
-                cls[b] = self.classifier.__getattr__(f'Downsample{b+1}')(
-                    cls[b]
+            for n in reversed(range(self.n_levels)):
+                if n != self.n_levels - 1:
+                    x = self.decoder.__getattr__(f'Upsample{n+1}')(x, siz[n])
+                out = self.decoder.__getattr__(f'ConvBlock{n+1}')(
+                    torch.cat([enc[n], x], dim=1)
                 )
-        """
-        c = self.classifier.__getattr__('FinalConvBlock')(cls)
-        breapkoint()
+                x = dec[n] = out[-1]
+                cls[n] = out[-(self.L)]
+        else:
+            # this is where you figure out how to just do the classifier stuff
+            breakpoint()
+
+                
+        # Classifier
+        if self.do_cnet:
+            for n in range(self.n_levels):
+                cls[n] = self.classifier.__getattr__(f'Downsample{n+1}')(
+                    cls[n]
+                )                
+            c = self.classifier.FinalConvBlock(cls)
+    
+
         return x, c
 
 
-
-#------------------------------------------------------------------------------
-#                           Up/downSampling functions
 #------------------------------------------------------------------------------
 
-class _DownSample(nn.Module):
+#class UNetXD_Longitudinal(nn.Module):
+    """
+    Main class for the 4D unet segmentation network. Input arguments will have
+    the same name convention as UClassNetXD (e.g. <param>_unet) even though 
+    this class not not directly involve the classifier.
+
+    Required inputs:
+    - in_channels:        no. input channels (most likely image modalities)
+    - out_channels_unet:  no. output channels for unet (label classes)
+
+    Optional args (general):
+    - feature_ratio:        factor to increase features at each level
+    - n_levels:             number of cnet levels
+    - n_starting_features:  number of features at highest spatial res.
+    - T:                    index of temporal dimension in input image
+    - X:                    number of spatial dimensions in input image
+
+    Optional args (unet):
+    - activ_func_unet           activation function for conv layers
+    - conv_kernel_size_unet:    size of 4D conv kernel
+    - conv_shape_unet:          shape of 4D conv kernel (hypercube/hypercross)
+    - drop_rate_unet:           dropout rate in conv layers (0 = no dropout)
+    - feature_ratio:            factor to increase features at each level
+    - n_convs_per_block_unet:   number of conv layers per unet level
+    - norm_func_unet:           normalization function for conv layers
+    - sample_down_func_unet:    downsampling function for enc. arm
+    - sample_up_func_unet:      upsampling function for dec. arm
+    - sample_kernel_size_unet:  size of sampling pool/conv kernel
+    - use_residuals:            flag for residual conns. in enc. arm
+    - use skips:                flag for skip conns. between enc./dec. arms 
+    """
+    
+    
+
+
+#------------------------------------------------------------------------------
+#                       Up/down sampling functions
+#------------------------------------------------------------------------------
+
+class _DownConv(nn.Module):
     def __init__(self,
                  n_features:int,
                  sampling_factor:list[int],
@@ -330,38 +330,43 @@ class _DownSample(nn.Module):
                  T:int=2,
                  temporal:bool=True
     ):
-        super(_DownSample, self).__init__()
+        super(_DownConv, self).__init__()
+
+        # Parse class args
         self.T = T
         self.temporal = temporal
-        
-        
-        func = Conv4d(
+
+        # Define sampling function
+        self.downsample = Conv4d(
             in_channels=n_features,
             out_channels=n_features,
             kernel_size=sampling_factor,
             stride=sampling_factor,
+            bias=False,
             X=X,
             T=T,
         ) if self.temporal else eval(f'nn.Conv{X}d')(
             in_channels=n_features,
             out_channels=n_features,
-            kernel_size=sampling_factor,
-            stride=sampling_factor,
+            kernel_size=sampling_factor[-X:],
+            stride=sampling_factor[-X:],
+            bias=False
         )
-        self.add_module('downsample', func)
         
         
     def forward(self, x, db=False):
-        x = (self.downconv(x) if self.temporal
+        x = (self.downsample(x) if self.temporal
              else torch.stack(
-                     [self.downconv(xt) for xt in x.movedim(self.T, 0)], dim=0
-             ).movedim(0, self.T)
+                     [self.downsample(xt)
+                      for xt in x.movedim(self.T, 0)
+                     ], dim=self.T
+             )
         )
         return x
 
 
 
-class _UpSample(nn.Module):
+class _UpConv(nn.Module):
     def __init__(self,
                  n_features:int,
                  sampling_factor:list[int],
@@ -369,42 +374,40 @@ class _UpSample(nn.Module):
                  T:int=2,
                  temporal:bool=True,
     ):
-        super(_UpSample, self).__init__()
+        super(_UpConv, self).__init__()
+
+        # Parse class args
         self.T = T
+        self.sampling_factor = sampling_factor
         self.temporal = temporal
 
-        func = Conv4d(
+        # Define sampling function
+        self.upsample = Conv4dTranspose(
             in_channels=n_features,
             out_channels=n_features,
             kernel_size=sampling_factor,
-            padding=1,
+            bias=False,
             X=X,
             T=T,
-        ) if self.temporal else eval(f'nn.Conv{X}d')(
+        ) if self.temporal else eval(f'nn.ConvTranspose{X}d')(
             in_channels=n_features,
             out_channels=n_features,
-            kernel_size=sampling_factor,
-            padding=1,
+            kernel_size=sampling_factor[-X:],
+            stride=sampling_factor[-X:],
+            bias=False
         )
-        self.add_module('upsample', func)
+        
 
-
-    def _repeat_interleave(self, x):
-        for d in range(self.T if self.temporal else self.T+1, len(x.shape)):
-            x = x.repeat_interleave(self.factor, dim=d)
-        return x
-    
-
-    def forward(self, x, out_shape):
-        x = self._repeat_interleave(x)
+    def forward(self, x, out_sz):
         x = (
             self.upsample(x) if self.temporal
             else torch.stack(
-                    [self.upsample(xt)for xt in x.movedim(self.T, 0)],
+                    [self.upsample(xt) for xt in x.movedim(self.T, 0)],
                     dim=self.T
             )
         )
         return x
+
 
     
 class _MaxPool(nn.Module):
@@ -416,23 +419,21 @@ class _MaxPool(nn.Module):
                  temporal:bool=True,
     ):
         super(_MaxPool, self).__init__()
+
+        # Parse class args
         self.T = T
         self.temporal = temporal
-        
-        spatial_func = eval(f'nn.MaxPool{X}d')(
+
+        # Define pooling functions
+        self.pool_spatial = eval(f'nn.MaxPool{X}d')(
             kernel_size=sampling_factor[1:],
             stride=spatial_factor,
             return_indices=True
         )
-        self.add_module('pool_spatial', spatial_func)
-
-        temporal_func = nn.MaxPool2d(
+        self.pool_temporal = nn.MaxPool2d(
             kernel_size=(sampling_factor[0], 1),
             stride=(temporal_factor, 1),
             return_indices=True
-        )
-        self.add_module(
-            'pool_temporal', temporal_func if self.temporal else None
         )
         
 
@@ -472,23 +473,21 @@ class _MaxUnpool(nn.Module):
                  temporal:bool=True,
     ):
         super(_MaxUnpool, self).__init__()    
-        
+
+        # Parse args
         self.X = X
         self.T = T
         self.temporal = temporal
 
-        spatial_func = eval(f'nn.MaxUnPool{X}d')(
-            kernel_size=sampling_factor[1:],
-            stride=spatial_factor,
+        # Define pooling function
+        self.unpool_spatial = eval(f'nn.MaxUnPool{X}d')(
+            kernel_size=sampling_factor[-X:],
+            stride=spatial_factor[-X:],
         )
-        self.add_module('unpool_spatial', spatial_func)
 
-        temporal_func = nn.MaxUnPool2d(
+        self.unpool_temporal = nn.MaxUnPool2d(
             kernel_size=(sampling_factor[0], 1),
             stride=(temporal_factor, 1),
-        )
-        self.add_module(
-            'unpool_temporal', temporal_func if self.temporal else None
         )
                 
 
@@ -514,78 +513,136 @@ class _MaxUnpool(nn.Module):
         return x_unpool
 
 
-
+    
 #------------------------------------------------------------------------------
 #                            Classifier functions
 #------------------------------------------------------------------------------
-    
-class _CNetSpatialDownBlock(nn.ModuleDict):
+
+class _CNetSpatialDownBlock(nn.Module):
+    """
+    Takes an input from the unet decoder and downsamples all spatial dimensions
+    to a single element (e.g. [B, C, T, H, W, D]-->[B, C, T, 1, 1, 1])
+    """
     def __init__(self,
-                 config:list[int],
-                 norm_func:str=None,
-                 activ_func:str=None,
-                 dropout_rate:float=0.,
+                 n_features:int,
+                 sampling_func,
+                 sampling_factor:int=2,
+                 X:int=3,
+                 T:int=2,
     ):
-        super(_CNetBlock, self).__init__()
-        n_layers = len(config) - 1
-        
-        for n in range(n_layers):
-            layer =_CNetLayer(n_input_features=config[n],
-                              n_output_features=config[n+1],
-                              norm_func=norm_func,
-                              activ_func=activ_func,
-                              dropout_rate=dropout_rate,
-            )
-            self.add_module('ConvLayer%d' % (n + 1), layer)
-            
-            
-    def forward(self, x):
-        x_out = [None] * (len(self.items()) + 1)
-        x_out[0] = x
-        for n, [name, layer] in enumerate(self.items()):
-            x_out[n+1] = layer(x_out[n])
-        return x_out
+        super(_CNetSpatialDownBlock, self).__init__()
+        self.X = X
+        self.T = T
 
-    
-
-class _CNetLayer(nn.Module):
-    def __init__(self,
-                 n_input_features:int,
-                 n_output_features:int,
-                 norm_func:str=None,
-                 activ_func:str=None,
-                 dropout_rate=0,
-                 **kwargs
-    ):
-        super(_CNetLayer, self).__init__()
-
-        activ = eval('nn.%s' % activ_func)() if activ_func is not None else nn.Identity()
-        conv = nn.Linear(n_input_features,
-                         n_output_features,
-                         bias=False # if norm_func is not None else True
+        self.downsample = sampling_func(
+            n_features=n_features,
+            sampling_factor=sampling_factor,
+            temporal=False,
+            X=X,
+            T=T
         )
-        self.add_module('activ', activ if activ_func is not None else nn.Identity())
-        self.add_module('conv', conv)
 
 
     def forward(self, x):
-        x = torch.concatenate(x, dim=1)
-        return self.conv(self.activ(x))
+        """
+        TO-DO: might need to handle the case when x.shape is to conv but not
+        quite [1, 1, 1]
+        """
+        while torch.where(torch.tensor(x.shape[-self.X:]) > 1)[0].numel() > 1:
+            x = self.downsample(x)
+            
+        for _ in range(self.X):
+            x = x.squeeze(-1)
+
+        return x
 
 
-    
+
+class _CNetTemporalDownBlock(nn.Module):
+    """
+    Takes a fully spatially downsampled input and downsamples the temporal
+    dimension (e.g. [B, C, T]-->[B, C, 1])
+    """
+    def __init__(self,
+                 n_features:int,
+                 sampling_factor:int=2,
+                 T:int=2,
+    ):
+        super(_CNetTemporalDownBlock, self).__init__()
+        self.T = T
+
+        self.downsample = nn.Conv1d(
+            in_channels=n_features,
+            out_channels=n_features,
+            kernel_size=sampling_factor,
+            stride=sampling_factor,
+            bias=False
+        )
+
+
+    def forward(self, x):
+        while x.shape[self.T] > 1:
+            x = self.downsample(x)
+        return x.squeeze(-1)
+
+
+
+class _CNetFinalBlock(nn.ModuleDict):
+    """
+    Takes a fully downsampled input and produces the final classifier output
+    """
+    def __init__(self,
+                 feature_config:list[int],
+                 activ_func=None,
+                 conv_size:int=3,
+    ):
+        super(_CNetFinalBlock, self).__init__()
+        self.n_layers = len(feature_config) - 1
+        padding_size = (
+            (conv_size - 1) // 2 if conv_size % 2 == 1 else conv_size // 2
+        )
+
+        # Add intermediate conv layers
+        for n in range(self.n_layers - 1):
+            func = nn.Linear(
+                in_features=feature_config[n],
+                out_features=feature_config[n+1],
+                bias=True
+            )
+            activ = (
+                activ_func() if activ_func is not None
+                else nn.Identity()
+            )
+            self.add_module(f'Layer{n+1}', nn.Sequential(func, activ))
+            
+        # Add last linear function
+        self.linear = nn.Linear(
+            in_features=feature_config[-2],
+            out_features=feature_config[-1],
+        )
+                    
+
+    def forward(self, x):
+        x = torch.cat(x, dim=1)
+        for n in range(self.n_layers - 1):
+            x = self.__getattr__(f'Layer{n+1}')(x)
+        x = self.linear(x)            
+        return x
+
+
+
 #------------------------------------------------------------------------------
-#                               U-Net functions
+#                     Unet block functions
 #------------------------------------------------------------------------------
 
 class _UNetBlock(nn.ModuleDict):
     def __init__(self,
                  feature_config:list[int],
-                 activ_func:str=None,
+                 activ_func=None,
                  conv_size:list[int]=3,
                  conv_shape:str='hypercube',
                  dropout_rate:float=0.,
-                 norm_func:str=None,
+                 norm_func=None,
                  residual:bool=False,
                  skip:bool=False,
                  temporal:bool=False,
@@ -597,21 +654,19 @@ class _UNetBlock(nn.ModuleDict):
 
         # Parse args
         n_layers = len(feature_config) - 1
-        layer_func = '_'.join(
-            ['_UNetLayer', 'long' if temporal else 'standard']
-        )
         self.use_residuals = residual
         
         for n in range(n_layers):
-            growth = 1 + (skip and n == n_layers - 1)
-            layer = eval(f'{layer_func}')(
-                n_input_features=feature_config[n],
-                n_output_features=growth*feature_config[n+1],
+            growth = 1 + (skip and n == 0)
+            layer = _UNetLayer(
+                n_input_features=growth*feature_config[n],
+                n_output_features=feature_config[n+1],
                 activ_func=activ_func,
                 conv_size=conv_size,
                 conv_shape=conv_shape,
                 dropout_rate=dropout_rate,
                 norm_func=norm_func,
+                temporal=temporal,
                 X=X,
                 T=T
             )
@@ -624,204 +679,29 @@ class _UNetBlock(nn.ModuleDict):
 
         for n, [name, layer] in enumerate(self.items()):
             res = x_out[n]
-            x_out[n+1] = layer(x_out[n], db=db)
-            
-            if self.residuals and name[-1]!='1':
-                x_out[n+1] += x_out[n]
-
-        return x_out
-
-
-
-class _UNetBlockTranspose(nn.ModuleDict):
-    def __init__(self,
-                 feature_config:list[int],
-                 activ_func:str=None,
-                 conv_size:list[int]=3,
-                 conv_shape:str='hypercube',
-                 dropout_rate:float=0.,
-                 norm_func:str=None,
-                 residual:bool=False,
-                 skip:bool=False,
-                 temporal:bool=False,
-                 X:int=3,
-                 T:int=2
-    ):
-        super(_UNetBlockTranspose, self).__init__()
-
-        # Parse args
-        n_layers = len(feature_config) - 1
-        layer_func = '_'.join(
-            ['_UNetLayerTranspose', 'long' if temporal else 'standard']
-        )        
-
-        # Add each layer
-        for n in range(n_layers):
-            growth = 1 + (skip and n == 0)
-            layer = eval(f'{layer_func}')(
-                n_input_features=growth*feature_config[n],
-                n_output_features=feature_config[n+1],
-                activ_func=activ_func,
-                conv_size=conv_size,
-                conv_shape=conv_shape,
-                dropout_rate=dropout_rate,
-                norm_func=norm_func,
-                X=X,
-                T=T
-            )
-            self.add_module(f'ConvLayer{n+1}', layer)
-
-
-    def forward(self, x):
-        x_out = [None] * (len(self.items()) + 1)
-        x_out[0] = x
-
-        for n, [name, layer] in enumerate(self.items()):
             x_out[n+1] = layer(x_out[n])
-
-            if self.residuals and name[-1]!='1':
-                x_out[n+1] += x_out[n]
             
+            if self.use_residuals and name[-1]!='1':
+                x_out[n+1] += x_out[n]
+
         return x_out
 
-
     
-class _UNetLayer_standard(nn.Module):
-    def __init__(self,
-                 n_input_features:int,
-                 n_output_features:int,
-                 activ_func:str=None,
-                 conv_size:list[int]=3,
-                 conv_shape:str=None,
-                 dropout_rate:float=0.,
-                 norm_func:str=None,
-                 X:int=3,
-                 T:int=2
-    ):
-        super(_UNetLayer_standard, self).__init__()
-
-        # Parse args
-        conv_kernel_size = (
-            [conv_size] * X if isinstance(conv_size, int) else conv_size
-        )
-        conv_padding_size = [
-            ((cs - 1) // 2) if cs % 2 == 1 else (cs // 2)
-            for cs in conv_kernel_size
-        ]
-        self.T = T
-
-        # Define functions
-        activ = (
-            activ_func() if activ_func is not None
-            else nn.Identity()
-        )
-        conv = eval('nn.Conv{X}d')(
-            in_channels=n_input_features,
-            out_channels=n_output_features,
-            kernel_size=conv_kernel_size,
-            padding=conv_padding_size,
-            bias=False if norm_func is not None else True
-        )
-        drop = (
-            eval('nn.Dropout{X}d')(p=dropout_rate) if dropout_rate > 0.
-            else nn.Identity()
-        )
-        norm = (
-            norm_func(n_input_features) if norm_func is not None
-            else nn.Identity()
-        )
-
-        # Add to class
-        self.add_module('norm', norm)
-        self.add_module('activ', activ)
-        self.add_module('conv', conv)
-        self.add_module('drop', drop)
-
-        
-    def forward(self, x):
-        x = torch.stack(
-            [self.drop(self.conv(self.activ(self.drop(xt))))
-             for xt in x.movedim(self.T, 0)
-            ], dim=self.T
-        )
-        return x
-
-
     
-class _UNetLayerTranspose_standard(nn.Module):
-    def __init__(self,
-                 X:int,
-                 n_input_features:int,
-                 n_output_features:int,
-                 T:int=2,
-                 norm_func:str=None,
-                 activ_func:str=None,
-                 dropout_rate=0,
-                 **kwargs
-    ):
-        super(_UNetLayerTranspose_standard, self).__init__()
-
-        # Parse args
-        conv_kernel_size = (
-            [conv_size] * X if isinstance(conv_size, int) else conv_size
-        )
-        conv_padding_size = [
-            ((cs - 1) // 2) if cs % 2 == 1 else (cs // 2)
-            for cs in conv_kernel_size
-        ]
-        self.T = T
-
-        # Define functions
-        activ = (
-            activ_func() if activ_func is not None
-            else nn.Identity()
-        )
-        conv = eval('nn.ConvTranspose{X}d')(
-            in_channels=n_input_features,
-            out_channels=n_output_features,
-            kernel_size=conv_kernel_size,
-            padding=conv_padding_size,
-            bias=False if norm_func is not None else True
-        )
-        drop = (
-            eval('nn.Dropout{X}d')(p=dropout_rate) if dropout_rate > 0.
-            else nn.Identity()
-        )
-        norm = (
-            norm_func(n_input_features) if norm_func is not None
-            else nn.Identity()
-        )
-
-        # Add to class
-        self.add_module('drop', drop)
-        self.add_module('norm', norm)
-        self.add_module('activ', activ)
-        self.add_module('conv', conv)
-
-
-    def forward(self, x):
-        x = torch.stack(
-            [self.conv(self.activ(self.norm(self.drop(xt))))
-             for xt in x.movedim(self.T, 0)
-            ], dim=self.T
-        )
-        return x
-
-
-
-class _UNetLayer_long(nn.Module):
+class _UNetLayer(nn.Module):
     def __init__(self,
                  n_input_features:int,
                  n_output_features:int,
-                 activ_func:str=None,
+                 activ_func=None,
                  conv_size:list[int]=3,
                  conv_shape:str='hypercube',
                  dropout_rate:float=0.,
-                 norm_func:str=None,
+                 norm_func=None,
+                 temporal:bool=True,
                  X:int=3,
                  T:int=2
     ):
-        super(_UNetLayer_long, self).__init__()
+        super(_UNetLayer, self).__init__()
 
         # Parse args
         conv_kernel_size = (
@@ -831,109 +711,113 @@ class _UNetLayer_long(nn.Module):
             ((cs - 1) // 2) if cs % 2 == 1 else (cs // 2)
             for cs in conv_kernel_size
         ]
+        self.temporal = temporal
         self.T = T
         
         # Define functions
-        activ = (
-            activ_func() if activ_func is not None
-            else nn.Identity()
-        )
-        conv = Conv4d(
+        self.conv = Conv4d(
             in_channels=n_input_features,
             out_channels=n_output_features,
             kernel_size=conv_kernel_size,
             kernel_shape=conv_shape,
             padding=conv_padding_size,
             bias=False if norm_func is not None else True
+	) if self.temporal else eval(f'nn.Conv{X}d')(
+            in_channels=n_input_features,
+            out_channels=n_output_features,
+            kernel_size=conv_kernel_size[-X:],
+            padding=conv_padding_size[-X:],
+            bias=False if norm_func is not None else True
         )
-        drop = (
-            eval('nn.Dropout{X}d')(p=dropout_rate) if dropout_rate > 0.
-            else nn.Identity()
-        )
-        norm = (
-            norm_func(n_input_features) if norm_func is not None
-            else nn.Identity()
-        )
-
-        # Add to class
-        self.add_module('drop', drop)
-        self.add_module('norm', norm)
-        self.add_module('activ', activ)
-        self.add_module('conv', conv)
-
-
-    def forward(self, x, db=False):
-        x = torch.stack(
-            [self.drop(xt) for xt in torch.stack(
-                [self.conv(self.activ(self.norm(self.drop(xt))))
-                 for xt in x.movedim(self.T, 0)
-                ], dim=self.T).movedim(self.T, 0)
-            ], dim=self.T
-        )
-        return x
-
-
-
-class _UNetLayerTranspose_long(nn.Module):
-    def __init__(self,
-                 n_input_features:int,
-                 n_output_features:int,
-                 activ_func:str=None,
-                 conv_size:list[int]=3,
-                 conv_shape:str='hypercube',
-                 dropout_rate:float=0.,
-                 norm_func:str=None,
-                 X:int=3,
-                 T:int=2
-    ):
-        super(_UNetLayerTranspose_long, self).__init__()
-
-        # Parse args
-        conv_kernel_size = (
-            [conv_size] * X if isinstance(conv_size, int) else conv_size
-        )
-        conv_padding_size = [
-            ((cs - 1) // 2) if cs % 2 == 1 else (cs // 2)
-            for cs in conv_kernel_size
-        ]
-        self.T = T
-
-        # Define functions
         activ = (
             activ_func() if activ_func is not None
             else nn.Identity()
         )
-        conv = ConvTranspose4d(
-            in_channels=n_input_features,
-            out_channels=n_output_features,
-            kernel_size=conv_kernel_size,
-            kernel_shape=conv_shape,
-            padding=conv_padding_size,
-            bias=False if norm_func is not None else True
-        )
         drop = (
-            eval('nn.Dropout{X}d')(p=dropout_rate) if dropout_rate > 0.
+            eval(f'nn.Dropout{X}d')(p=dropout_rate) if dropout_rate > 0.
             else nn.Identity()
         )
         norm = (
-            norm_func(n_input_features) if norm_func is not None
+            norm_func(n_output_features) if norm_func is not None
             else nn.Identity()
         )
+        self.layer_funcs = nn.Sequential(norm, activ, drop)
 
-        # Add to class
-        self.add_module('drop', drop)
-        self.add_module('norm', norm)
-        self.add_module('activ', activ)
-        self.add_module('conv', conv)
         
-
     def forward(self, x):
-        x = self.conv(
-            torch.stack(
-                [self.activ(self.norm(self.drop(xt)))
-                 for xt in x.movedim(self.T, 0)
-                ], dim=self.T
+        x = torch.stack(
+            [self.layer_funcs(xt) for xt in self.conv(x).movedim(self.T, 0)]
+            if self.temporal else
+            [self.layer_funcs(self.conv(xt)) for xt in x.movedim(self.T, 0)]
+            , dim=self.T
+        )
+        return x
+
+
+#------------------------------------------------------------------------------
+#                              Utility functions
+#------------------------------------------------------------------------------
+
+def _print_arg_error(instr:str, cls=None):
+    func = 'unet4d_classifier.py' if cls is None else cls.__class__.__name__
+    if cls is None:
+        utils.fatal(f'Error in {func}.__init__: {instr}')
+
+
+def _parse_arg_as_list(cls, arg, dtype):
+    varname = f'{arg=}'.split('=')[0]
+    if not isinstance(arg, list):
+        arg = (list(arg) if isinstance(arg, tuple)
+               else [arg] * (cls.X+1)
+        )
+    if len(arg) != cls.X + 1:
+        if len(arg) == 1:
+            arg = arg * (cls.X+1)
+        else:
+            varname = f'{arg=}'.split('=')[0]
+            _print_arg_error(
+                f'{varname} must be {dtype} or list/tuple of {dtype} of '
+                f'len=={cls.X+1} (input was {arg})'
             )
-        )
-        return x
+    return arg
 
+        
+def _parse_arg_as_function(cls, arg):
+    try:
+        arg = eval(f'{arg}')
+    except:
+        try:
+            arg = eval(f'{arg}{cls.X}d')
+        except:
+            varname = f'{arg=}'.split('=')[0]
+            _print_arg_error(
+                f'{arg} (or {arg}{cls.X}d) is not a valid input for {varname} '
+                f'(not a valid callable function)'
+            )
+    return arg
+
+    
+def _valid_configured_input(cls, arg, valid_list):
+    if arg not in valid_list:
+        varname = f'{arg=}'.split('=')[0]
+        _print_arg_error(
+            f'{arg} not a valid input for {varname} (must be in '
+            f'{valid_list})'
+        )
+    return arg
+
+        
+
+def _print_model_size(model):
+    param_size = 0.
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+
+    buffer_size = 0.
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    print(f'model size: {size_all_mb:.3f}MB')
+    
+    

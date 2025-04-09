@@ -162,12 +162,11 @@ class MinMaxNorm:
                 x[:, c, t, ...] = torch.clamp(
                     x[:, c, t, ...], min=m[c, t], max=M[c, t]
                 )
-        return utils._min_max_norm(x, m=self.m, M=self.M)
+        return utils.min_max_norm(x, m=self.m, M=self.M)
         
     
     def __call__(self, inputs):
-        inputs[0] = self._robust_norm(inputs[0]) if self.use_robust \
-             else self._min_max_norm(inputs[0])
+        inputs[0] = self._robust_norm(inputs[0])
         return inputs
 
     
@@ -404,53 +403,62 @@ class CropPatch:
         self.X = X
         self.patch_sz = [patch_sz] * X if isinstance(patch_sz, int)\
             else patch_sz
+        if len(self.patch_sz) != self.X:
+            utils.fatal(
+                f'Error in augmentations.CropPatch: patch_sz must have X={X} '
+                f'number of dimensions (input was patch_sz={patch_sz})'
+            )
         
+        # Random or center crop?
         self._get_bounds = (
             self._get_random_crop_bounds if randomize
             else self._get_center_crop_bounds
         )
+        self.crop_prealloc = torch.zeros(
+            size=((1, 1, 1) + tuple(self.patch_sz)), dtype=torch.float
+        )
+        
 
-
-    def _get_center_crop_bounds(self, vol_sz, bbox:list=None):
+    def _get_center_crop_bounds(self, full_sz, bbox:list=None):
         """
         Get bounds of crop window centered within input image
         """
-        vol_sz = vol_sz[-self.X:]
+        full_sz = full_sz[-self.X:]
         patch_sz = self.patch_sz
 
         if bbox is not None:
             center = [(bb[0] + bb[1])//2 for bb in bbox]
         else:
-            center = [vs//2 for vs in vol_sz]
+            center = [vs//2 for vs in full_sz]
         bounds = [[c - ps//2, c + ps//2] for c, ps in zip(center, patch_sz)]
 
         for i in range(self.X):
             if bounds[i][0] < 0:  shift = bounds[i][0]
-            elif bounds[i][1] > vol_sz[i]:  shift = bounds[i][1] - vol_sz[i]
+            elif bounds[i][1] > full_sz[i]:  shift = bounds[i][1] - full_sz[i]
             else:  shift = 0
             bounds[i] = [bounds[i][0] - shift, bounds[i][1] - shift]
 
         return bounds
 
 
-    def _get_random_crop_bounds(self, vol_sz, bbox:list=None,
+    def _get_random_crop_bounds(self, full_sz, bbox:list=None,
                                 return_bounds=False
     ):
         """
         Get bounds of randomly placed crop window within input image
         """
-        vol_sz = vol_sz[-self.X:]
+        full_sz = full_sz[-self.X:]
         patch_sz = self.patch_sz
 
         if bbox is not None:
             rand_bounds = [
                 [max([0, bbox[i][1] - patch_sz[i] + 1]),
-                 min([vol_sz[i] - patch_sz[i], bbox[i][0]])]
+                 min([full_sz[i] - patch_sz[i], bbox[i][0]])]
                 for i in range(self.X)
             ]
         else:
             rand_bounds = [
-                [0, vol_sz[i] - patch_sz[i]] for i in range(self.X)
+                [0, full_sz[i] - patch_sz[i]] for i in range(self.X)
             ]
 
         start_idx = [
@@ -464,17 +472,22 @@ class CropPatch:
         return bounds
     
 
-    def _apply_crop(self, vol, bounds):
+    def _apply_crop(self, x, bounds):
         """
         Extract patch of input volume within bounds (same bounds for all 
         channels/timepoints)
         """
+        # Copy preallocated tensor
+        repeats = x.shape[:-self.X] + (1,) * self.X
+        crop = self.crop_prealloc.clone().repeat(repeats).to(x.device)
+
+        # Crop input volume
         if self.X == 2:
             h, w = bounds
-            crop = vol[..., h[0]:h[1], w[0]:w[1]]
+            crop[:] = x[..., h[0]:h[1], w[0]:w[1]]
         elif self.X >= 3:
             h, w, d = bounds
-            crop = vol[..., h[0]:h[1], w[0]:w[1], d[0]:d[1]]
+            crop[:] = x[..., h[0]:h[1], w[0]:w[1], d[0]:d[1]]
         else:
             print(f'Invalid X (X=={self.X}')
 
