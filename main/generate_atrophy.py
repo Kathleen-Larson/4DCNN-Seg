@@ -5,6 +5,7 @@ import numpy as np
 import surfa as sf
 import random
 import yaml
+from collections import OrderedDict
 
 import torch
 import torch.optim
@@ -18,8 +19,8 @@ import utils
 class SynthLongitudinal(nn.Module):
     def __init__(self,
                  sdict:dict,                  # dict of labels to atrophy
-                 IOdict:dict,                 # dict of in->out label mappings
-                 in_shape:list[int],           # no. expected shape of input
+                 img_dict:dict,               # dict of img label mappings
+                 in_shape:list[int],          # expected shape of input
                  bg_labels:list[int]=0,       # background label val
                  do_insert_lsns:bool=False,   # flag to insert lesions
                  do_resize_labels:bool=True,  # flag to do synthetic atrophy
@@ -28,6 +29,7 @@ class SynthLongitudinal(nn.Module):
                  max_n_lsns:int=0,            # max no. lesions to insert
                  n_dims:int=3,                # no. image dimesions (2 or 3)
                  n_tps:int=2,                 # no. timepoints to synthesize
+                 seg_dict=None,               # dict for label IO mappings
                  subsample:float=1.0,         # % to subsamle atrophy
                  T:int=2,                     # index of temporal dim.
                  device=None,
@@ -39,41 +41,51 @@ class SynthLongitudinal(nn.Module):
         self.n_timepoints = n_tps
         self.n_dims = n_dims
 
+        self.IO_labels_dict = seg_dict
+        
         max_n_lsns = max_n_lsns if do_insert_lsns else 0
         sdict = sdict if do_resize_labels else None
         
         # Check inputs
-        in_shape = ((int(in_shape),) * n_dims
-                    if isinstance(in_shape, int) or isinstance(in_shape, float)
-                    else in_shape
+        in_shape = (
+            (int(in_shape),) * n_dims
+            if isinstance(in_shape, int) or isinstance(in_shape, float)
+            else in_shape
         )
         while len(in_shape) < n_dims + 2:
             in_shape = (1,) + tuple(in_shape)
-
+            
         # Initialize models for each timepoint
-        self.synth_atrophy = nn.Module()        
+        self.synth_atrophy = nn.ModuleList([])
+
         for t in range(n_tps):
-            add_lesions = _AddLesions(
-                in_shape=in_shape, lesions_label=lsns_label,
-                max_n_lesions=max_n_lsns, bg_labels=lsns_in,
+            model = nn.Module()
+            model.add_lesions = _AddLesions(
+                in_shape=in_shape,
+                lesions_label=lsns_label,
+                max_n_lesions=max_n_lsns,
+                bg_labels=lsns_in,
                 device=device
             ) if max_n_lsns > 0 else nn.Identity()
-
-            resize_labels = _ResizeLabels(
-                sdict=sdict, subsample=subsample,
-                in_shape=in_shape, device=device
+            model.resize_labels = _ResizeLabels(
+                sdict=sdict,
+                subsample=subsample,
+                in_shape=in_shape,
+                device=device
             ) if sdict is not None and t > 0 else nn.Identity()
-
-            labels_to_image = _LabelsToImage(
-                IOdict=IOdict, in_shape=in_shape,
-                bg_labels=bg_labels, device=device
+            model.labels_to_image = _LabelsToImage(
+                IOdict=img_dict,
+                in_shape=in_shape,
+                bg_labels=bg_labels,
+                device=device
             )
-            
-            model = nn.Module()
-            model.add_module('AddLesions', add_lesions)
-            model.add_module('ResizeLabels', resize_labels)
-            model.add_module('LabelsToImage', labels_to_image)
-            self.synth_atrophy.add_module(f'SynthModel{t}', model)
+            self.synth_atrophy.append(model)
+        
+
+    def _replace_labels(self, x):
+        for key, val in self.IO_labels_dict.items():
+            x[x==key] = val
+        return x
             
 
     def forward(self, y_in):
@@ -81,13 +93,15 @@ class SynthLongitudinal(nn.Module):
         y = [None] * self.n_timepoints
 
         for t in range(self.n_timepoints):
-            model = self.synth_atrophy.__getattr__(f'SynthModel{t}')
-            y[t] = model.AddLesions(y_in if t == 0 else y[t-1].clone())
-            y[t] = model.ResizeLabels(y[t])
-            X[t] = model.LabelsToImage(y[t])
+            y[t] = self.synth_atrophy[t].resize_labels(
+                self.synth_atrophy[t].add_lesions(
+                    y_in if t == 0 else y[t-1]
+                )
+            )
+            X[t] = self.synth_atrophy[t].labels_to_image(y[t])
 
         X = torch.stack(X, dim=-(self.n_dims+1))
-        y = torch.stack(y, dim=-(self.n_dims+1))
+        y = self._replace_labels(torch.stack(y, dim=-(self.n_dims+1)))
         return X, y
 
     
@@ -281,10 +295,11 @@ class _ResizeLabels(nn.Module):
 
             target_vol_change = sdict[label][0]
             vol_change = 0.
-            
-            while abs(vol_change) < abs(target_vol_change):
-                change_remaining = target_vol_change - vol_change
 
+            it = 0
+            while abs(vol_change) < abs(target_vol_change) and it < 20:
+                change_remaining = target_vol_change - vol_change
+                
                 for neighbor in nbr_list:
                     nbr_mask = (x == neighbor).float()
                     if target_vol_change < 0:
@@ -293,17 +308,19 @@ class _ResizeLabels(nn.Module):
                         )
                         x = torch.where(nbr_mask.bool(), neighbor, x)
                     else:
-                        trg_mask, nbr_mask = \
+                        trg_mask, nbr_mask = (
                             self._shift_label_boundary(
                                 trg_mask, nbr_mask,
                                 max_vol_change=change_remaining
                             )
+                        )
                         x = torch.where(trg_mask.bool(), label, x)
                         
                 vol_change = ((trg_mask.sum() - trg_mask_orig.sum()) \
                               / trg_mask_orig.sum()).item()
-                
-        return x
+                it += 1
+
+            return x
 
 
     def _randomize_sdict(self):
@@ -320,9 +337,9 @@ class _ResizeLabels(nn.Module):
         sdict = {}
         for n, label in enumerate(self.sdict.keys()):
             max_perc = self.sdict[label][0]
-            perc = random.uniform(max_perc, 0.) if max_perc < 0 \
-                else random.uniform(0., max_perc)
-            sdict[label] = [perc] + self.sdict[label][1:]        
+            perc = random.uniform(max_perc, -0.1) if max_perc < 0 \
+                else random.uniform(0.1, max_perc)
+            sdict[label] = [perc] + self.sdict[label][1:]
 
         return sdict
 
@@ -417,46 +434,84 @@ class _LabelsToImage(nn.Module):
     
 #------------------------------------------------------------------------------
 
-def _config_synth_models(config:dict, include_lesions=True, device=None):
+def _config_synth_models(        
+        synth_image_lut,
+        synth_labels_lut=None,
+        slist_config:str=None,
+        bg_labels:list[int]=0,
+        do_insert_lsns:bool=False,
+        do_resize_labels:bool=True,
+        in_shape:int=256,
+        include_lesions=True,
+        max_perc_atrophy:float=-0.2,
+        max_perc_lesion_growth:float=0.5,
+        device=None,
+        **kwargs
+):
     """
     Configures all synth models given an input config dict
-    """    
-    # Load label lookup table
-    if not 'lut' in config:
-        utils.fatal('Error: must include path to lut in input config')
-    lut = sf.load_label_lookup(config['lut'])
-
-    # Get dict of corresponding right/left label values (d = {right: left})
-    lr_dict = {}
-    for Rkey, Rval in lut.items():
-        if 'Right' in Rval.name:
-            lr_dict[Rkey] = search_lut(
-                lut, '-'.join(['Left'] + Rval.name.split('-')[1:])
-            )[0]
+    """
     
-    # Get label dictionaries
-    synth_slists_config = yaml.safe_load(open(config['slist_config']))
+    # Get dict of corresponding right/left label values (d = {right: left})
+    if not os.path.isfile(synth_image_lut):
+        utils.fatal('synth_image_lut={synth_image_lut} not a valid file')
+    synth_image_lut = sf.load_label_lookup(synth_image_lut)
+
+    lr_dict = {}    
+    for key, val in synth_image_lut.items():
+        if 'Left' not in val.name:
+            if 'Right' in val.name:
+                lr_dict[key] = search_lut(
+                    synth_image_lut,
+                    '-'.join(['Left'] + val.name.split('-')[1:])
+                )[0]
+            else:
+                lr_dict[key] = key
+
+    # Dict for I/O label correspondancy
+    if synth_labels_lut is None:
+        synth_labels_lut = synth_image_lut
+    else:
+        if isinstance(synth_labels_lut, str):
+            if not os.path.isfile(synth_labels_lut):
+                utils.fatal(
+                    'synth_labels_lut={synth_labels_lut} not a valid file'
+                )
+            synth_labels_lut = sf.load_label_lookup(synth_labels_lut)
+
+    io_dict = {}
+    for key in synth_image_lut.keys():
+        io_dict[key] = key if key in synth_labels_lut else 0
+        
+    # Dict for atrophy induction (slists)
+    synth_slists_config = yaml.safe_load(open(slist_config))
     synth_slists = {}
 
     for _class, sdict in synth_slists_config.items():
         synth_slists[_class] = {}
         for label, slist in sdict.items():
-            key = search_lut(lut, label)[0]
-            synth_slists[_class][key] = [config['max_perc_atrophy']] + [
-                search_lut(lut, name)[0] for name in slist
+            key = search_lut(synth_image_lut, label)[0]
+            synth_slists[_class][key] = [max_perc_atrophy] + [
+                search_lut(synth_image_lut, name)[0] for name in slist
             ]
 
     # Build models
     synth_models = {}
     for _class, sdict in synth_slists.items():
         synth_models[_class] = SynthLongitudinal(
-            sdict=sdict, IOdict=lr_dict, device=device,
-            **config['model_config']
+            sdict=sdict,
+            img_dict=lr_dict,
+            seg_dict=io_dict,
+            in_shape=in_shape,
+            do_insert_lsns=do_insert_lsns,
+            do_resize_labels=do_resize_labels,
+            device=device
         )
 
     return synth_models
     
 
+#------------------------------------------------------------------------------
 
 def dilate_binary_mask(x, conv, n:int=1, dtype=None):
     dtype = x.type() if dtype is None else dtype
@@ -491,11 +546,10 @@ def gaussian_kernel(sigma:float, ndims:int=3):
     return kernel / kernel.sum()
 
 
-def init_convolution(in_shape, out_shape, conv_weight_data,
-                     kernel_size:int=3, stride:int=1,
-                     padding:int=1, dilation:int=1,
-                     bias=False, ndims:int=3, device=None,
-                     requires_grad:bool=False,
+def init_convolution(
+        in_shape, out_shape, conv_weight_data,
+        kernel_size:int=3, stride:int=1, padding:int=1, dilation:int=1,
+        bias=False, ndims:int=3, device=None, requires_grad:bool=False,
 ):
     in_channels = in_shape[1]
     out_channels = out_shape[1]

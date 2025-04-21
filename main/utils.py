@@ -18,13 +18,14 @@ def fatal(message:str):
 
 
 def init_text_file(fname, string, check_if_exists=False):
-    if check_if_exists and os.path.isfile(fname):
-        print(f'{fname} already exists!')
-        return True
+    if fname is not None:
+        if check_if_exists and os.path.isfile(fname):
+            print(f'{fname} already exists!')
+            return True
     
-    f = open(fname, 'w')
-    f.write(string + '\n')
-    f.close()
+        f = open(fname, 'w')
+        f.write(string + '\n')
+        f.close()
 
 
 def parse_args():
@@ -33,6 +34,11 @@ def parse_args():
                         default='configs/train_base.yaml',
                         help='.yaml file path to configure all parameters; '
                         'default is configs/train.yaml')
+    parser.add_argument('-infer_only', '--infer_only', action='store_true',
+                        help='Flag to run only inference and no training on '
+                        'input data')
+    parser.add_argument('-output_dir', '--output_dir', default=None,
+                        help='directory to store all model outputs')
     parser.add_argument('-print_time', '--print_time', action='store_true',
                         help='Flag to print date/time at start and end of '
                         'running (useful for slurm)')
@@ -42,6 +48,13 @@ def parse_args():
                         help='Flag to use cuda for  gpu assistance (will '
                         'use only cpu if not specified')
     return parser.parse_args()
+
+
+def arg_error(instr:str, cls=None):
+    if cls is None:
+        fatal(f'{instr}')
+    else:
+        fatal(f'Error in {cls.__class__.__name__}.__init__: {instr}')
     
     
 def set_seeds(seed):
@@ -71,31 +84,6 @@ def unsqueeze_repeat(x, dims:list[int], repeats=None):
 #-----------------------------------------------------------------------------#
 #                               Image utilities                               #
 #-----------------------------------------------------------------------------#
-
-def get_crop_window(vol, patch_sz=[96, 96, 96], bffr:int=2):
-    vol_sz = vol.shape
-    bbox = [[0, vol_sz[i]-1] for i in range(len(vol_sz))]
-
-    while np.sum(vol[bbox[0][0],:,:]) == 0: bbox[0][0] += 1
-    while np.sum(vol[bbox[0][1],:,:]) == 0: bbox[0][1] -= 1
-    while np.sum(vol[:,bbox[1][0],:]) == 0: bbox[1][0] += 1
-    while np.sum(vol[:,bbox[1][1],:]) == 0: bbox[1][1] -= 1
-    while np.sum(vol[:,:,bbox[2][0]]) == 0: bbox[2][0] += 1
-    while np.sum(vol[:,:,bbox[2][1]]) == 0: bbox[2][1] -= 1
-
-    bbox = [[bb[0] - (bffr), bb[1] + (bffr)] for bb in bbox]
-    center = [(bb[0] + bb[1])//2 for bb in bbox]
-    bounds = [[c - ps//2, c + ps//2] for c, ps in zip(center, patch_sz)]
-
-    for i in range(len(bbox)):
-        if bounds[i][0] < 0:  shift = bounds[i][0]
-        elif bounds[i][1] > vol_sz[i]:  shift = bounds[i][1] - vol_sz[i]
-        else:  shift = 0
-        bounds[i] = [bounds[i][0] - shift, bounds[i][1] - shift]
-
-    return bounds
-
-
 
 def largest_connected_component(x, vals=None, bgval=0):
     """

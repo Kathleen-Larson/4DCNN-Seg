@@ -16,21 +16,22 @@ import torch.nn as nn
 import torch.optim
 from torch.utils.data import DataLoader, RandomSampler
 
-#import segmenter
 from synth_dataset import _config_datasets
 from generate_atrophy import _config_synth_models
 import utils
-from unet4d_classifier import UClassNetXD_Longitudinal
-from segmenter import SynthAtrophySegmenter
+from unet4d_classifier import UCNetLong
+from segmenter_synth_ucnet import SynthUCNetSegmenter
 
 #------------------------------------------------------------------------------
 
 def main(pargs):
     # Parse commandline args
+    infer_only = pargs.infer_only
+    output_dir = pargs.output_dir
     print_time = pargs.print_time
     resume_training = pargs.resume
     use_cuda = pargs.use_cuda
-
+    
     if print_time:
         print('Start time:',  datetime.now())
 
@@ -48,9 +49,7 @@ def main(pargs):
             print('CUDA is unavailable, running w/ cpu')
     utils.set_seeds(config['seed'])
     torch.set_float32_matmul_precision('medium')
-
-    # Build synth models
-    synth_models = _config_synth_models(config['synth'], device=device)
+    torch.cuda.memory._set_allocator_settings("max_split_size_mb:128")
     
     # Create datasets
     datasets = _config_datasets(
@@ -60,16 +59,14 @@ def main(pargs):
         device=device,
     )
     if 'train' in datasets:
-        if ('steps_per_epoch' in config['training']
-            and config['training']['steps_per_epoch'] is None):
+        if utils.check_config(config['training'], 'steps_per_epoch'):
+            n_train_samples = config['training']['steps_per_epoch']
+        else:
             n_train_samples = len(datasets['train'])
             config['training']['steps_per_epoch'] = n_train_samples
-        else:
-            n_train_samples = config['training']['steps_per_epoch']
     else:
         n_train_samples = None
-
-
+        
     # Generate data loaders
     loaders = {}
     for key in datasets:
@@ -84,28 +81,7 @@ def main(pargs):
             else DataLoader(datasets[key], **config['dataloader'])
         )
 
-    # Initialize segmentation model + optimizer
-    network = UClassNetXD_Longitudinal(
-        in_channels=datasets['test'].__n_input__(),
-        out_channels_unet=datasets['test'].__n_class__(),
-        out_channels_cnet=len(synth_models),
-        **config['network']
-    ).to(device)
-    optimizer = _config_optimizer(network.parameters(), **config['optimizer'])
-
-    # Configure segmenter
-    segmenter = SynthAtrophySegmenter(
-        synth=synth_models,
-        model=network,
-        optimizer=optimizer,
-        resume=resume_training,
-        infer_only=False,
-        device=device,
-        n_train_samples=n_train_samples,
-        **config['training']
-    )
-
-    # Print cohort #s info
+    # Print out dataset info
     n_test = len(datasets['test']) if 'test' in datasets else 0
     n_train = len(datasets['train']) if 'train' in datasets else 0
     n_valid = len(datasets['valid']) if 'valid' in datasets else 0
@@ -114,6 +90,66 @@ def main(pargs):
     bffr = '-' * (len(fstr) + 2)
     print(f'{bffr}\n {fstr}\n{bffr}')
 
+    # Initialize synth model
+    synth_models = _config_synth_models(
+        device=device, synth_labels_lut=datasets['test'].lut,
+        **config['synth']
+    )
+    
+    # Initialize UCNet model
+    do_class = (
+        config['training']['do_class']
+        if utils.check_config(config['training'], 'do_class')
+        else True
+    )
+    
+    n_inputs = datasets['test'].__n_input__()
+    n_labels = datasets['test'].__n_class__()
+    n_classes = len(synth_models) if do_class else None
+
+    model = UCNetLong(
+        in_channels=n_inputs, out_channels_unet=n_labels,
+        out_channels_cnet=n_classes, do_class=do_class,
+        **config['model']
+    ).to(device)
+
+    # Initialize optimizer
+    freeze_cnet = config['training']['freeze_cnet'] if (
+        utils.check_config(config['training'], 'freeze_cnet')
+    ) else False
+    freeze_unet = config['training']['freeze_unet'] if (
+        utils.check_config(config['training'], 'freeze_unet')
+    ) else False
+    
+    model_params = []
+    if do_class and not freeze_cnet:
+        model_params += list(model.cnet.parameters())
+    if not freeze_unet:
+        model_params += list(model.unet.parameters())
+
+    if len(model_params) == 0 and not infer_only:
+        utils.fatal(
+            'Model has no parameters... check if both freeze_cnet and '
+            'freeze_unet are True (?)'
+        ) 
+
+    optimizer = _config_optimizer(model_params, **config['optimizer'])
+
+    # Configure segmenter
+    config['training']['output_dir'] = output_dir if (
+        not utils.check_config(config['training'], 'output_dir')
+    ) else config['training']['output_dir']
+
+    segmenter = SynthUCNetSegmenter(
+        synth=synth_models,
+        model=model,
+        optimizer=optimizer,
+        resume=resume_training,
+        infer_only=False,
+        device=device,
+        n_train_samples=n_train_samples,
+        **config['training']
+    )
 
     # Run training
     for epoch in range(segmenter.current_epoch, segmenter.max_n_epochs):
@@ -125,7 +161,7 @@ def main(pargs):
             segmenter._predict(loader=loaders['valid'], loss_type='valid')
 
         segmenter._epoch_end()
-
+    
     # Run inference
     if 'test' in loaders:
         segmenter._predict(
@@ -139,6 +175,7 @@ def main(pargs):
     if print_time:
         print('End time:',  datetime.now())
 
+        
 #------------------------------------------------------------------------------
 
 def _config_optimizer(network_params, **config):
