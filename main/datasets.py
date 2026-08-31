@@ -38,7 +38,9 @@ class BaseDataset(Dataset):
             in_lut=None,
             out_lut=None,
             merge_LR_labels=True,
+            include_onehot=True,
             X=3,
+            resample=None,
             device=None
     ):
         # Labels lookup tables
@@ -59,19 +61,23 @@ class BaseDataset(Dataset):
 
         # Set up data augmentations
         aug_list_full = [
-            None if self.out_lut is None
+            aug.Resample(resample_factor=resample, X=self.X) if resample and resample > 0
+            else None
+        ] + [
+            None if self.out_lut is None or not include_onehot
             else aug.AssignOneHotLabels(label_values=[x for x in self.out_lut], X=self.X)
         ]
         aug_list_partial = aug_list_full.copy()
-
+        
+        if aug_config.get('_functions') is not None:
+            aug_config['_train'] = aug_config['_functions']
+            aug_config['_infer'] = aug_config['_functions']
+            
         if aug_config.get('_train') is not None:
             for func, config in aug_config['_train'].items():
                 config['X'] = self.X
 
-            aug_list_full = [
-                None if self.out_lut is None
-                else aug.AssignOneHotLabels(label_values=[x for x in self.out_lut], X=self.X)
-            ] + [
+            aug_list_full += [
                 getattr(aug, func)(**aug_config['_train'][func])
                 for func in aug_config['_transform_order'] if func in aug_config['_train']
             ]
@@ -80,10 +86,7 @@ class BaseDataset(Dataset):
             for func, config in aug_config['_infer'].items():
                 config['X'] = self.X
 
-            aug_list_partial = [
-                None if self.out_lut is None
-                else aug.AssignOneHotLabels(label_values=[x for x in self.out_lut], X=self.X)
-            ] + [
+            aug_list_partial += [
                 getattr(aug, func)(**aug_config['_infer'][func])
                 for func in aug_config['_transform_order'] if func in aug_config['_infer']
             ]
@@ -102,6 +105,12 @@ class BaseDataset(Dataset):
             self.full_augmentations = None
             self.partial_augmentations = aug.ComposeTransforms(None)
             self.data_shape = [256] * self.X
+
+        # Resample output?
+        self.resample = (
+            aug.Resample(resample_factor=(1. / resample), X=self.X)
+            if resample and resample > 0. else None
+        )
 
     def __len__(self) -> int:
         if self.input_label_files is not None:
@@ -137,12 +146,32 @@ class BaseDataset(Dataset):
 
         return sf.labels.LabelLookup(lut_dict), lr_dict
 
+    def _extract_unique_substr(self, strlist):
+        """
+        Function to extract unique substring from a list of strings (useful for parsing subject or
+        timepoint ids from a list of filenames) 
+        """
+        lead = os.path.commonprefix(strlist)
+        tail = os.path.commonprefix([s[::-1] for s in strlist])[::-1]
+        while lead and lead[-1].isalnum():
+            lead = lead[:-1]
+        while tail and tail[0].isalnum():
+            tail = tail[1:]
+        return [s[len(lead):len(s) - len(tail)] for s in strlist]
+
     def _save_volume(self, img, outdir, outbase, idx, is_labels=False, is_onehot=False,
                      rescale=True, make_subdir=False):
-
-        basename = '.'.join([self.outbases[idx], outbase, 'mgz'])
-        outdir = os.path.join(outdir, self.outbases[idx]) if make_subdir else outdir
+        """
+        Save volumes
+        """
+        basename = '.'.join([outbase, 'mgz'])
+        outdir = os.path.join(outdir, self.subject_ids[idx]) if make_subdir else outdir
         os.makedirs(outdir, exist_ok=True)
+        #breakpoint()
+        if self.resample:
+            while len(img.shape) < self.X + 3:
+                img = img.unsqueeze(dim=1)
+            img = self.resample([img])[0].squeeze()
 
         utils.save_volume(
             x=img.softmax(dim=1) if is_onehot else img,
@@ -169,6 +198,7 @@ class SynthDataset(BaseDataset):
             '_'.join([outbase, os.path.basename(x).split('.')[0]])
             for x in self.input_label_files
         ]
+        self.subject_ids = self.outbases
 
     def __getitem__(self, idx):
         # Input labels (seeds for synthetic atrophy)
@@ -230,18 +260,36 @@ class MultiTimepointTestDataset(BaseDataset):
     Regular dataset with no ground truth labels (inference only)
     """
     def __init__(self, image_files, label_files, outbase, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(include_onehot=False, **kwargs)
 
         # Parse I/O
         self.input_image_files = image_files
         self.input_label_files = None
 
-        self.outbases = [x for x in map(list, zip(*(self.input_image_files)))]
-        self.outbases = [
-            '_'.join([outbase, os.path.basename(x).split('.')[0]])
-            for x in [y for y in map(list, zip(*(self.input_image_files)))][0]
-        ]
         self.n_timepoints = len(self.input_image_files[0])
+
+        # Get filenames for outputs
+        def _extract_unique_substr(strlist):
+            lead = os.path.commonprefix(strlist)
+            tail = os.path.commonprefix([s[::-1] for s in strlist])[::-1]
+            while lead and lead[-1].isalnum():
+                lead = lead[:-1]
+            while tail and tail[0].isalnum():
+                tail = tail[1:]
+            return [s[len(lead):len(s) - len(tail)] for s in strlist]
+
+        self.subject_ids = [
+            sid for sid in self._extract_unique_substr(
+                [os.path.commonprefix(flist) for flist in self.input_image_files]
+            )
+        ]
+        self.timepoint_ids = [
+            [x for x in self._extract_unique_substr(flist)] for flist in self.input_image_files
+        ]
+        self.outbases = [
+            ['_'.join([outbase, sid, tpid]) for tpid in tplist]
+            for sid, tplist in zip(self.subject_ids, self.timepoint_ids)
+        ]
 
     def __getitem__(self, idx):
         inputs = torch.stack([
@@ -268,6 +316,7 @@ def _config_datasets(
         outbase=None,          # string to add to basename of output files
         output_lut_path=None,  # path to label lookup table for output data
         randomize=False,       # flag to randomize data order
+        resample=None,
         split_ratio=0.2,       # ratio of no. valid/test to no. train
         df_has_header=False,   # flag to specify if data_config_path has header line
         device=None
@@ -341,12 +390,13 @@ def _config_datasets(
         ]
 
     # Create torch dataset for each cohort
+    datasets_dict = {}
     _class = (
         SynthDataset if do_synth
         else MultiTimepointTestDataset if infer_only
         else StaticDataset
     )
-    datasets_dict = {}
+
     for n, (idxs, split_name) in enumerate(zip(idxs_lists, data_split_names)):
         datasets_dict[split_name] = _class(
             image_files=(
@@ -363,6 +413,7 @@ def _config_datasets(
             out_lut=out_lut,
             outbase=outbase,
             device=device,
+            resample=resample,
             X=n_image_dims,
             merge_LR_labels=merge_LR_labels,
         )

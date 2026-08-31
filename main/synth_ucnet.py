@@ -120,13 +120,12 @@ def main(pargs):
 
     # Initialize synth models
     n_image_dims = datasets.get(ref_dataset).X
-
     synth_classes_config = yaml.safe_load(
         open(config.get('synth').get('slist_synth_classes_config'))
     )
     control_prob = config.get('synth').get('control_prob')
     synth_diseases = (
-        ['Control'] + [x for x in synth_classes_config.keys()] if control_prob > 0
+        ['Control'] + [x for x in synth_classes_config.keys()] if infer_only or control_prob > 0
         else [x for x in synth_classes_config.keys()]
     )
     n_synth_classes = len(synth_diseases)
@@ -173,7 +172,7 @@ def main(pargs):
         return_multiple=(True if do_cnet and not do_fine_tuning else False),
         **config['unet']
     ).to(device2 if do_cnet else device) if do_unet else None
-
+    
     cnet = CNetLong(
         in_channels=unet.n_transfer_features,
         out_channels=n_labels,
@@ -211,7 +210,7 @@ def main(pargs):
         else resume_cnet_path if (resume_training or infer_only) and do_cnet
         else None
     )
-
+    
     load_fine_tune = False
     resume_fine_tune_path = os.path.join(output_dir, 'model_last_fine_tune.pth')
     fine_tune_state_path = (
@@ -657,7 +656,7 @@ class SynthUCNet:
             self.cnet.train() if not self.freeze_cnet else self.cnet.eval()
             self.cnet.zero_grad()
 
-        augmentations = loader.dataset.partial_augmentations
+        augmentations = loader.dataset.full_augmentations
 
         for y, idx in loader:
             self.current_step += 1
@@ -666,12 +665,14 @@ class SynthUCNet:
             # Synthesize images from input volume (?)
             if self.synthesizer is not None:
                 control_prob = self.synthesizer.get('control_prob')
-
+                prob = random.uniform(0., 1.)
+                
                 synth_class, synth_model = (
                     ('Control', self.synthesizer.get('Control'))
-                    if control_prob is not None and random.uniform(0., 1.) < control_prob
+                    if control_prob is not None and prob < control_prob
                     else random.choice(list(self.synthesizer['DiseaseClasses'].items()))
                 )
+
                 X, y = synth_model(
                     [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
                     else [y.to(synth_model.device)]
@@ -691,7 +692,7 @@ class SynthUCNet:
             """
             """
             self._save_model_outputs(
-                dataset=loader.dataset, idx=idx, save_dir='examples_OASIS1_CSFaugments_v3',
+                dataset=loader.dataset, idx=idx, save_dir='synth_fix_testing',
                 data_dict={
                     'Input': X,
                     'Target': utils.replace_labels(
@@ -705,6 +706,7 @@ class SynthUCNet:
             if self.current_step == 5:
                 exit()
             """
+
             # Run model
             if self.unet_optimizer is not None:
                 self.unet_optimizer.zero_grad()
@@ -716,7 +718,7 @@ class SynthUCNet:
             if self.fine_tune_layers is not None:
                 unet_output_initial, skip_conn = self.unet(X.to(self.device))
                 unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
-
+                cnet_input = unet_output_initial
             else:
                 unet_output = (
                     self.unet(X.to(self.device)) if self.unet is not None
@@ -728,10 +730,10 @@ class SynthUCNet:
                     unet_logits = cnet_input = unet_output
 
             cnet_logits, _ = (
-                self.cnet(unet_output_initial.to(self.device2)) if self.cnet is not None
+                self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
                 else (None, None)
             )
-
+            
             # Compute losses
             loss = 0.
             if self.seg_loss is not None:
@@ -748,6 +750,7 @@ class SynthUCNet:
                 )
                 loss += loss_class
                 loss_avg += loss.item()
+            
             """
             # Write data?
             y = utils.replace_labels(
@@ -762,19 +765,23 @@ class SynthUCNet:
             )
             print(f'Writing data for {loader.dataset.outbases[idx]}')
             self._save_model_outputs(
-                dataset=loader.dataset, idx=idx, save_dir='testing_include_cerebellum',
+                dataset=loader.dataset, idx=idx, save_dir='synth_fix_testing',
                 data_dict={'Input': X, 'Target': y, 'Posteriors': None, 'Output': seg}
             )
+            predicted_class = self.synth_classes[
+                torch.argmax(torch.softmax(cnet_logits, dim=1), dim=1)
+            ]
+            print(f'Class: {synth_class}, predicted: {predicted_class}')        
             breakpoint()
-            """
+
             """
             fstr = f'{(self.current_epoch + 1):>5}, {(self.current_epoch_step + 1):>4},'
             if self.multiple_losses:
                 fstr += f' {loss_seg.item():>.4f},' if self.seg_loss is not None else ''
                 fstr += f' {loss_class.item():>.4f},' if self.class_loss is not None else ''
             fstr += f' {loss.item():>.4f}, ({synth_class}),'
-            print(fstr, cnet_logits.data)
-
+            #print(fstr, cnet_logits.data)
+            """
             if (self.current_epoch_step + 1) % 10 == 0:
                 breakpoint()
             """
@@ -842,8 +849,9 @@ class SynthUCNet:
 
         augmentations = loader.dataset.partial_augmentations
 
-        for y, idx in loader:
+        for y, idx in loader:            
             if self.synthesizer is not None:
+                # Run data synthesizer
                 control_prob = self.synthesizer.get('control_prob')
                 synth_class, synth_model = (
                     ('Control', self.synthesizer.get('Control'))
@@ -855,16 +863,22 @@ class SynthUCNet:
                     [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
                     else [y.to(synth_model.device)]
                 )
+            elif isinstance(y, tuple):
+                # Data is both image and labels
+                X, y = y
+            else:
+                # Data is just image
+                X = y
+                y = None
 
-            X, y = augmentations([X, y]) if augmentations is not None else y
+            X, y = augmentations([X, y]) if augmentations is not None else (X, y)
 
             # Run model
             with torch.no_grad():
                 if self.fine_tune_layers is not None:
                     unet_output_initial, skip_conn = self.unet(X.to(self.device))
                     unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
-                    # fine_tune_input = self.unet(X.to(self.device))
-                    # unet_logits, cnet_input = self.fine_tune_layers(fine_tune_input)
+                    cnet_input = unet_output_initial
 
                 else:                    
                     unet_output = (
@@ -877,10 +891,10 @@ class SynthUCNet:
                         unet_logits = cnet_input = unet_output
 
                 cnet_logits, change_map = (
-                    self.cnet(unet_output_initial.to(self.device2)) if self.cnet is not None
+                    self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
                     else (None, None)
                 )
-
+                
             # Compute losses
             loss = 0.
 
@@ -1055,7 +1069,7 @@ class SynthUCNet:
         )
 
         for t in range(nT):
-            outbase = f'timepoint{t}'
+            outbase = f'{dataset.outbases[idx]}.timepoint{t}'
             if data_dict.get('Input') is not None:
                 nC = data_dict['Input'].shape[1]
                 for c in range(nC):

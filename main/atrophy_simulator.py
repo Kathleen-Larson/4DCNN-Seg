@@ -193,6 +193,83 @@ class SynthLongitudinal(nn.Module):
 
         return idict
 
+    def _fix_WM_hypointensities_labels(self, x):
+        """
+        Reclassifies WM hypointensities as the appropri
+        """
+        # Initialize dilation filter
+        structuring_element = torch.zeros((3,) * self.X, dtype=float)
+        if self.X == 2:
+            structuring_element[
+                torch.tensor([0, 1, 1, 1, 2]),
+                torch.tensor([1, 0, 1, 2, 1])] = 1.
+        elif self.X == 3:
+            structuring_element[
+                torch.tensor([1, 1, 2, 0, 1, 1, 1]),
+                torch.tensor([1, 1, 1, 1, 1, 0, 2]),
+                torch.tensor([1, 2, 1, 1, 0, 1, 1])] = 1.
+        else:
+            print(':(')
+
+        dilation_filter = init_convolution(
+            in_shape=x.shape,
+            out_shape=x.shape,
+            conv_weight_data=structuring_element,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            bias=False,
+            requires_grad=False,
+            device=self.device,
+            X=self.X,
+        )
+
+        # Compile list of WM labels and hypointensity labels
+        LWM_label = 2
+        RWM_label = 41
+
+        hypo_labels = []
+        for key, val in self.IO_labels_dict.items():
+            if val == -1:
+                hypo_labels.append(key)
+
+        """
+        - Get combined WM+hypos mask
+        - Iteratively...
+        1. Dilate LWM and RWM
+        2. Get overlap with hypos
+        3. Apply combined mask
+        4. Repeat until all hypos are gone
+        """
+        
+        # Get masks
+        M = torch.isin(
+            x, torch.tensor([LWM_label, RWM_label] + hypo_labels).to(x.device)
+        ).to(x.dtype)
+        M_l = torch.where(x == LWM_label, 1, 0).to(x.dtype)
+        M_r = torch.where(x == RWM_label, 1, 0).to(x.dtype)
+        M_h = None
+
+        # Iteratively shrink M_h by combining with M_l and M_r
+        while (M_l + M_r).sum() < M.sum():
+            M_l_new = dilate_binary_mask(M_l, dilation_filter) * M * (1 - M_r)
+            M_r_new = dilate_binary_mask(M_r, dilation_filter) * M * (1 - M_l)
+            if (M_l_new + M_r_new).sum() == (M_l + M_r).sum():
+                M_h = M * (1 - (M_l + M_r))
+                break
+            else:
+                M_l = M_l_new
+                M_r = M_r_new
+                
+        # Insert back into original label map
+        if M_h is not None:
+            x[M_h == 1] = 0
+        x[M_l == 1] = LWM_label
+        x[M_r == 1] = RWM_label
+        
+        return x
+
     def _replace_labels(self, x):
         for key, val in self.IO_labels_dict.items():
             x[x == key] = val
@@ -201,7 +278,7 @@ class SynthLongitudinal(nn.Module):
     def forward(self, y_in):
         X = [None] * self.T
         y = [None] * self.T
-
+        
         # Generate intensities for image synthesis (if reference image is supplied)
         intensities_dict = None
         if isinstance(y_in, (list, tuple)):
@@ -210,17 +287,18 @@ class SynthLongitudinal(nn.Module):
             )
             y_in = y_in[0]
 
-        atrophy_dict = [{}] * (self.T - 1)
+        # Fix WM hypointensities in input label map
+        #y_in = self._fix_WM_hypointensities_labels(y_in)
 
         # Simulate atrophy
         atrophy_dict = [{}] * (self.T - 1)
-
+        
         for t in range(self.T):
             if self.different_lesion_means:
                 labels_with_lesions, lesion_map = self.synth_atrophy[t].add_lesions(
                     self.resample_input(y_in) if t == 0 else y[t - 1])
 
-                # remap lesions to new labels
+                # remap lesions to new slabels
                 lesion_map = lesion_map.to(labels_with_lesions.dtype)  # convert to int
                 old_max = labels_with_lesions.max()
                 labels_with_lesions[lesion_map > 1] = lesion_map[lesion_map > 1] + old_max
@@ -249,7 +327,7 @@ class SynthLongitudinal(nn.Module):
                   y1.squeeze().movedim(0, -1).cpu().numpy(), 
                   X.squeeze().movedim(0, -1).cpu().numpy())
             pdb.set_trace()
-
+            
         return (X, y, atrophy_dict) if self.return_sdict is True else (X, y)
 
 
@@ -387,7 +465,7 @@ class _LabelsToImage(nn.Module):
                  max_intensity=255,     # max image intensity
                  noise_std=0.05,        # std dev of gaussian white noise (rel. to max intensity)
                  same_across_tps=True,  # use same random seed for all timepts
-                 deform_images=True,    # flag to apply a spatial deformation
+                 deform_images=True,    # flag to apply a (small) spatial deformation
                  X=3,                   # no. image spatial dims (2 or 3)
                  device=None):
         super(_LabelsToImage, self).__init__()
@@ -456,7 +534,7 @@ class _LabelsToImage(nn.Module):
         # Set up image warping
         if self.deform_images:
             self.transform_dict = {
-                'elastic_factor': 0.01, 'elastic_std': 3., 'n_elastic_steps': 7, 'X': self.X,
+                'elastic_factor': 0.01, 'elastic_std': 2., 'n_elastic_steps': 7, 'X': self.X,
                 'apply_affine': False, 'zero_center': True, 'apply_elastic': True, 'randomize': True
             }
             self.elastic = aug.AffineElasticTransform(**self.transform_dict)
@@ -481,12 +559,12 @@ class _LabelsToImage(nn.Module):
             xt = x[:, :, t, ...]
 
             # Create masks of CSF and background
-            BG_mask = torch.zeros_like(y[:, :, t, ...]).float()
+            BG_mask = torch.zeros_like(y[:, :, t, ...]).to(torch.float)
             for bg in self.bg_labels:
                 BG_mask[y[:, :, t, ...] == bg] = 1
 
-            FG_mask = torch.where(y[:, :, t, ...] > 0, 1., 0.)
-            CSF_mask = FG_mask.clone().float()
+            FG_mask = torch.where(y[:, :, t, ...] > 0, 1, 0).to(torch.float)
+            CSF_mask = FG_mask.clone()
 
             # Expand GM into background to create CSF mask
             for i in range(random.randint(1, 4)):
@@ -680,15 +758,13 @@ class _ResizeLabels(nn.Module):
             M[M.nonzero(as_tuple=True)], 0.
         )
         return M
-
+    
     def _is_adjacent(self, x, label1, label2):
         """
         Determines whether or not two labels in the same volume are adjacent
         """
-        mask1 = dilate_binary_mask(
-            (x == label1).float(), self.dilation_conv)
-        mask2 = dilate_binary_mask(
-            (x == label2).float(), self.dilation_conv)
+        mask1 = dilate_binary_mask((x == label1).int(), self.dilation_conv)
+        mask2 = dilate_binary_mask((x == label2).int(), self.dilation_conv)
         return True if (mask1 * mask2).sum() > 0 else False
 
     def _shift_label_boundary(self, M_dil, M_ero, max_vol_change=None):
@@ -790,10 +866,12 @@ class _ResizeLabels(nn.Module):
         # Now add target structures
         if s_targ is not None:
             for label in s_targ:
-                amt = (
-                    random.uniform(self.sdict[label][0], self.sdict[label][1]) if self.randomize
-                    else 0.5 * sum(self.sdict[label][0] + self.sdict[label][1])
-                )
+                amt = 0
+                while (amt > self.control_bounds[0] * 2) and (amt < self.control_bounds[1] * 2):
+                    amt = (
+                        random.uniform(self.sdict[label][0], self.sdict[label][1]) if self.randomize
+                        else 0.5 * sum(self.sdict[label][0] + self.sdict[label][1])
+                    )
                 nbrs = random.sample(self.neighbors_dict[label], k=len(self.neighbors_dict[label]))
                 sdict[label] = [amt] + nbrs
 
@@ -830,26 +908,27 @@ def _config_synth_models(
     Configures all synth models given an input config dict
     """
 
-    # Get dict of corresponding right/left label values (d = {right: left})
+    # Get dict of labels that should have the same synth intensity (d = {right: left})
     if isinstance(synth_image_lut, (str, os.PathLike)):
         if not os.path.isfile(synth_image_lut):
             fatal('synth_image_lut={synth_image_lut} not a valid file')
         synth_image_lut = sf.load_label_lookup(synth_image_lut)
 
-    lr_dict = {}
+    img_dict = {}
     for key, val in synth_image_lut.items():
         if 'Right' in val.name:
-            lr_dict[key] = search_lut(
+            img_dict[key] = search_lut(
                 synth_image_lut,
                 '-'.join(['Left'] + val.name.split('-')[1:])
             )[0]
         else:
-            lr_dict[key] = key
+            img_dict[key] = key
 
-    for key in lr_dict.keys():
+    for key in img_dict.keys():
         if key >= 1000:
-            lr_dict[key] = 3
+            img_dict[key] = 3
 
+            
     # Dict for I/O label correspondancy
     if synth_labels_lut is None:
         synth_labels_lut = synth_image_lut
@@ -858,17 +937,23 @@ def _config_synth_models(
             if not os.path.isfile(synth_labels_lut):
                 fatal(f'synth_labels_lut={synth_labels_lut} not a valid file')
             synth_labels_lut = sf.load_label_lookup(synth_labels_lut)
-
-    io_dict = {}
-    for key in synth_image_lut.keys():
+    
+    seg_dict = {}
+    for key, val in synth_image_lut.items():
         if key in synth_labels_lut:
-            io_dict[key] = key
-        elif key >= 1000 and key <= 1035:
-            io_dict[key] = 3
-        elif key >= 2000 and key <= 2035:
-            io_dict[key] = 42
+            seg_dict[key] = key
+        elif 'ctx-lh' in val.name:
+            seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-Cortex')[0]
+        elif 'ctx-rh' in val.name:
+            seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-Cortex')[0]
+        #elif val.name == 'Left-WM-hypointensities':
+        #    seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-White-Matter')[0]
+        #elif val.name == 'Right-WM-hypointensities':
+        #    seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-White-Matter')[0]
+        #elif val.name == 'WM-hypointensities':
+        #    seg_dict[key] = -1
         else:
-            io_dict[key] = 0
+            seg_dict[key] = 0
 
     # Dict for atrophy induction (slists)
     slist_synth_classes_config = yaml.safe_load(open(slist_synth_classes_config))
@@ -895,8 +980,8 @@ def _config_synth_models(
         synth_model = SynthLongitudinal(
             sdict=sdict,           # structures for atrophing (no atrophy -> set to None)
             neighbors_dict=slist_neighbors,  # all possible labels+neighbors for vol changes
-            img_dict=lr_dict,      # label map seen by imagesynth (e.g., {Lwm: Lwm, Rwm: Lwm}
-            seg_dict=io_dict,      # output labels to segment (e.g., combining different aparc GM)
+            img_dict=img_dict,      # label map seen by imagesynth (e.g., {Lwm: Lwm, Rwm: Lwm}
+            seg_dict=seg_dict,      # output labels to segment (e.g., combining different aparc GM)
             in_shape=in_shape,
             control_bounds=control_change_bounds,
             do_resample=do_resample,
@@ -914,8 +999,8 @@ def _config_synth_models(
         synth_models['Control'] = SynthLongitudinal(
             sdict={},
             neighbors_dict=slist_neighbors,
-            img_dict=lr_dict,
-            seg_dict=io_dict,
+            img_dict=img_dict,
+            seg_dict=seg_dict,
             in_shape=in_shape,
             control_bounds=control_change_bounds,
             do_resample=do_resample,
@@ -935,7 +1020,7 @@ def dilate_binary_mask(x, conv, n=1, dtype=None):
     dtype = x.type() if dtype is None else dtype
     if n > 0:
         for i in range(n):
-            x = conv(x)
+            x = conv(x.to(torch.float))
         return torch.where(x > 0., 1., 0.).type(dtype)
     else:
         return x
