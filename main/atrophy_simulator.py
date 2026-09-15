@@ -242,7 +242,7 @@ class SynthLongitudinal(nn.Module):
         3. Apply combined mask
         4. Repeat until all hypos are gone
         """
-        
+
         # Get masks
         M = torch.isin(
             x, torch.tensor([LWM_label, RWM_label] + hypo_labels).to(x.device)
@@ -261,13 +261,13 @@ class SynthLongitudinal(nn.Module):
             else:
                 M_l = M_l_new
                 M_r = M_r_new
-                
+
         # Insert back into original label map
         if M_h is not None:
             x[M_h == 1] = 0
         x[M_l == 1] = LWM_label
         x[M_r == 1] = RWM_label
-        
+
         return x
 
     def _replace_labels(self, x):
@@ -278,7 +278,7 @@ class SynthLongitudinal(nn.Module):
     def forward(self, y_in):
         X = [None] * self.T
         y = [None] * self.T
-        
+
         # Generate intensities for image synthesis (if reference image is supplied)
         intensities_dict = None
         if isinstance(y_in, (list, tuple)):
@@ -288,11 +288,11 @@ class SynthLongitudinal(nn.Module):
             y_in = y_in[0]
 
         # Fix WM hypointensities in input label map
-        #y_in = self._fix_WM_hypointensities_labels(y_in)
+        # y_in = self._fix_WM_hypointensities_labels(y_in)
 
         # Simulate atrophy
         atrophy_dict = [{}] * (self.T - 1)
-        
+
         for t in range(self.T):
             if self.different_lesion_means:
                 labels_with_lesions, lesion_map = self.synth_atrophy[t].add_lesions(
@@ -318,7 +318,7 @@ class SynthLongitudinal(nn.Module):
 
         X, y = self.labels_to_image(y, intensities_dict)  # X is the image, y is the label map
         y = self._replace_labels(y)
-
+        
         if 0:
             y1 = torch.clone(y)
             import freesurfer as fs
@@ -327,7 +327,7 @@ class SynthLongitudinal(nn.Module):
                   y1.squeeze().movedim(0, -1).cpu().numpy(), 
                   X.squeeze().movedim(0, -1).cpu().numpy())
             pdb.set_trace()
-            
+
         return (X, y, atrophy_dict) if self.return_sdict is True else (X, y)
 
 
@@ -750,15 +750,15 @@ class _ResizeLabels(nn.Module):
 
     def _apply_dropout_to_mask(self, M, dr):
         """
-        Applies a dropout filter to an input mask (adds variability to the 
-        label boundaries during dilation/erosion)
+        Applies a dropout filter to an input mask (adds variability to the label boundaries during
+        dilation/erosion)
         """
         M[M.nonzero(as_tuple=True)] = torch.where(
             torch.rand((int(M.sum())), dtype=M.dtype, device=M.device) > dr,
             M[M.nonzero(as_tuple=True)], 0.
         )
         return M
-    
+
     def _is_adjacent(self, x, label1, label2):
         """
         Determines whether or not two labels in the same volume are adjacent
@@ -767,26 +767,20 @@ class _ResizeLabels(nn.Module):
         mask2 = dilate_binary_mask((x == label2).int(), self.dilation_conv)
         return True if (mask1 * mask2).sum() > 0 else False
 
-    def _shift_label_boundary(self, M_dil, M_ero, max_vol_change=None):
+    def _replace_boundary(self, x, M, nbr_list, label):
         """
-        Moves the boundary between two labels to induce a specific amount of 
-        volumetric change (M_dil will grow by M_chg, M_ero will shrink by M_chg)
+        Replaces atrophied boundary with most likely neighbor label
         """
-        M_chg = dilate_binary_mask(M_dil, self.dilation_conv) * M_ero
+        if len(nbr_list) == 1:
+            # Only 1 neighbor --> trivial
+            x = torch.where(M, nbr_list[0], x)
+        else:
+            # Multiple neighbors --> use binary image morphology again
+            for nbr in nbr_list:
+                M_bdr = dilate_binary_mask(x == nbr, self.dilation_conv) & M
+                x[M_bdr] = nbr
+        return x
 
-        # Apply dropout if necessary
-        if self.dropout_rate > 0.:
-            M_chg = self._apply_dropout_to_mask(M_chg, self.dropout_rate)
-
-        # Ensure dilation mask is not inducing too much change
-        if max_vol_change is not None:
-            vol_change = M_chg.sum() / M_ero.sum()
-
-            if vol_change > abs(max_vol_change):
-                dr = (abs(vol_change) - abs(max_vol_change)) / vol_change
-                M_chg = self._apply_dropout_to_mask(M_chg, dr)
-
-        return M_dil + M_chg, M_ero - M_chg
 
     def _resize_labels(self, x, sdict):
         """
@@ -795,7 +789,11 @@ class _ResizeLabels(nn.Module):
         out_dict = {}
 
         for label in sdict:
-            # Create mask of specified adjacent neighbor labels
+            trg_change = sdict[label][0]
+            vol_change = 0.
+            it = 0
+            
+            # Set up neighbor and target masks
             nbr_list = sdict[label][1:]
             M_nbr = torch.zeros(x.shape, device=x.device).float()
 
@@ -803,38 +801,62 @@ class _ResizeLabels(nn.Module):
                 if not self._is_adjacent(x, label, neighbor):
                     nbr_list.pop(idx)
 
-            # Resize target
+            M_nbr = torch.isin(x, torch.tensor(nbr_list).to(x.device)).float()
+
             M_trg = (x == label).float()
             M_trg_orig = M_trg.clone()
 
-            trg_change = sdict[label][0]
-            vol_change = 0.
+            # Iteratively resize by 1 voxel boundary at a time
+            while abs(vol_change) < abs(trg_change) and it < 100:                
+                if trg_change > 0:
+                    # Get mask for outward boundary shift
+                    M_shift = dilate_binary_mask(M_trg, self.dilation_conv) * M_nbr
+                    if self.dropout_rate > 0.:
+                        M_shift = self._apply_dropout_to_mask(M_shift, self.dropout_rate)
+                    
+                    # Make sure we did not overshoot change
+                    vol_change = ((M_trg + M_shift).sum() / M_trg_orig.sum()) - 1
+                    if vol_change > trg_change:
+                        dr = (abs(vol_change) - abs(trg_change)) / vol_change
+                        M_shift = self._apply_dropout_to_mask(M_shift, dr)
+                        vol_change = ((M_trg + M_shift).sum() / M_trg_orig.sum()) - 1
 
-            it = 0
-            while abs(vol_change) < abs(trg_change) and it < 100:
-                change_remaining = trg_change - vol_change
+                    # Shift boundary
+                    M_trg += M_shift
+                    M_nbr -= M_shift
 
-                for neighbor in nbr_list:
-                    M_nbr = (x == neighbor).float()
-                    if trg_change < 0:
-                        M_nbr, M_trg = self._shift_label_boundary(
-                            M_nbr, M_trg, max_vol_change=change_remaining
-                        )
-                        x = torch.where(M_nbr.bool(), neighbor, x)
-                    else:
-                        M_trg, M_nbr = self._shift_label_boundary(
-                            M_trg, M_nbr, max_vol_change=change_remaining
-                        )
-                        x = torch.where(M_trg.bool(), label, x)
+                    # Replace in original label map
+                    x = torch.where(M_shift.bool(), label, x)
+                    
+                elif trg_change < 0:
+                    # Get mask for inward boundary shift
+                    M_shift = dilate_binary_mask(M_nbr, self.dilation_conv) * M_trg
+                    if self.dropout_rate > 0.:
+                        M_shift = self._apply_dropout_to_mask(M_shift, self.dropout_rate)
+                        
+                    # Make sure we did not overshoot change
+                    vol_change = ((M_trg - M_shift).sum() / M_trg_orig.sum()) - 1
+                    if vol_change < trg_change:
+                        dr = (abs(trg_change) - abs(vol_change)) / vol_change
+                        M_shift = self._apply_dropout_to_mask(M_shift, dr)
+                        vol_change = ((M_trg - M_shift).sum() / M_trg_orig.sum()) - 1
+                    
+                    #  Shift boundary
+                    M_nbr += M_shift
+                    M_trg -= M_shift
 
-                    vol_change = ((M_trg.sum() - M_trg_orig.sum()) / M_trg_orig.sum()).item()
+                    if label == 2016:
+                        breakpoint()
+                    
+                    # Replace in original label map
+                    x = self._replace_boundary(x, M_shift.bool(), nbr_list, label)
 
                 it += 1
 
-            if debug:
-                vc = vol_change
-                tvc = trg_change
-                print(f'label {label}: vol_change {vc:.2f}, requested {tvc:.2f} in {it} iters')
+            # if debug:
+            vc = vol_change
+            tvc = trg_change
+            print(f'label {label}: vol_change {vc:.4f}, requested {tvc:.4f} in {it} iters')
 
             out_dict[label] = [vol_change] + nbr_list
 
@@ -880,7 +902,7 @@ class _ResizeLabels(nn.Module):
     def forward(self, x):
         sdict = self._configure_sdict()
         x, odict = self._resize_labels(x, sdict)
-
+        breakpoint()
         return (x, odict) if self.return_dict else x
 
 
@@ -928,7 +950,6 @@ def _config_synth_models(
         if key >= 1000:
             img_dict[key] = 3
 
-            
     # Dict for I/O label correspondancy
     if synth_labels_lut is None:
         synth_labels_lut = synth_image_lut
@@ -937,7 +958,7 @@ def _config_synth_models(
             if not os.path.isfile(synth_labels_lut):
                 fatal(f'synth_labels_lut={synth_labels_lut} not a valid file')
             synth_labels_lut = sf.load_label_lookup(synth_labels_lut)
-    
+
     seg_dict = {}
     for key, val in synth_image_lut.items():
         if key in synth_labels_lut:
@@ -946,12 +967,6 @@ def _config_synth_models(
             seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-Cortex')[0]
         elif 'ctx-rh' in val.name:
             seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-Cortex')[0]
-        #elif val.name == 'Left-WM-hypointensities':
-        #    seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-White-Matter')[0]
-        #elif val.name == 'Right-WM-hypointensities':
-        #    seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-White-Matter')[0]
-        #elif val.name == 'WM-hypointensities':
-        #    seg_dict[key] = -1
         else:
             seg_dict[key] = 0
 
@@ -972,7 +987,11 @@ def _config_synth_models(
 
     for label, neighbors in slist_neighbors_config.items():
         key = search_lut(synth_image_lut, label)[0]
-        slist_neighbors[key] = [search_lut(synth_image_lut, neighbor)[0] for neighbor in neighbors]
+        slist_neighbors[key] = [
+            0 if 'CSF' in neighbor and 'ctx' in label # specific to aseg/aparc labels
+            else search_lut(synth_image_lut, neighbor)[0]
+            for neighbor in neighbors
+        ]
 
     # Initialize disease classes
     synth_models = {'DiseaseClasses': {}}
@@ -993,7 +1012,7 @@ def _config_synth_models(
             **kwargs
         )
         synth_models['DiseaseClasses'][_class] = synth_model
-
+        
     # Add control class?
     if control_prob > 0:
         synth_models['Control'] = SynthLongitudinal(
