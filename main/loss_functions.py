@@ -9,24 +9,27 @@ from scipy.ndimage import distance_transform_edt
 
 import utils
 
+
 # --------------------------------------------------------------------------------------------------
 # Cross-entropy losses
 
-def bce_loss(output, target, possible, weight=1.,reduction='mean'):
+def bce_loss(output, target, possible, weight=1., reduction='mean'):
     nB = output.shape[0]
     target = torch.tensor(
         [x == target for x in possible], dtype=torch.float, device=output.device
     ).view(output.shape)
     loss = nn.BCEWithLogitsLoss(reduction=reduction)(output, target)
     return weight * loss
-    
+
 
 def cce_loss(output, target, possible, weight=1., reduction='mean'):
     target = [target] if not isinstance(target, (list, tuple)) else target
-    idxs = [possible.index(x) for x in target]
-    target = torch.tensor(idxs, dtype=torch.long, device=output.device)    
+    target = torch.tensor(
+        [possible.index(x) for x in target], dtype=torch.long, device=output.device
+    )
     loss = nn.CrossEntropyLoss(reduction=reduction)(output, target)
     return weight * loss
+
 
 # --------------------------------------------------------------------------------------------------
 # Dice losses
@@ -46,7 +49,7 @@ def mean_dice_loss(output, target, weight=1., eps=1e-5, compute_softmax=True, co
     numer = (2 * output * target).sum(dim=-1)
     denom = (output + target).sum(dim=-1)
     dice = (numer + eps) / (denom + eps)
-    
+
     loss = (1 - dice).mean()
     return weight * loss
 
@@ -63,7 +66,6 @@ def mean_dice_diff_loss(output, target, weight=1., eps=1e-5, compute_softmax=Tru
 
     numer = (2 * output * target).sum(dim=-1)
     denom = (output + target).sum(dim=-1)
-    
+
     loss = (1 - (numer + eps) / (denom + eps)).mean()
     return weight * loss
-

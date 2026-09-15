@@ -172,7 +172,7 @@ def main(pargs):
         return_multiple=(True if do_cnet and not do_fine_tuning else False),
         **config['unet']
     ).to(device2 if do_cnet else device) if do_unet else None
-    
+
     cnet = CNetLong(
         in_channels=unet.n_transfer_features,
         out_channels=n_labels,
@@ -210,7 +210,7 @@ def main(pargs):
         else resume_cnet_path if (resume_training or infer_only) and do_cnet
         else None
     )
-    
+
     load_fine_tune = False
     resume_fine_tune_path = os.path.join(output_dir, 'model_last_fine_tune.pth')
     fine_tune_state_path = (
@@ -622,6 +622,7 @@ class SynthUCNet:
             log_str += 'unet_change_loss ' if self.unet_change_loss is not None else ''
             log_str += 'class_loss ' if self.class_loss is not None else ''
             log_str += 'total_loss ' if self.multiple_losses else ''
+            log_str += 'accuracy' if self.class_loss is not None else ''
 
             utils.init_text_file(
                 self.test_log, f'FileId {log_str}',
@@ -647,6 +648,7 @@ class SynthUCNet:
     def _train(self, loader):
         N = len(loader)
         loss_avg = 0.
+        accuracy = 0.
 
         if self.unet is not None:
             self.unet.train() if not self.freeze_unet else self.unet.eval()
@@ -666,7 +668,7 @@ class SynthUCNet:
             if self.synthesizer is not None:
                 control_prob = self.synthesizer.get('control_prob')
                 prob = random.uniform(0., 1.)
-                
+
                 synth_class, synth_model = (
                     ('Control', self.synthesizer.get('Control'))
                     if control_prob is not None and prob < control_prob
@@ -690,9 +692,9 @@ class SynthUCNet:
                 loader.dataset, 'target', idx, save_dir='examples'
             )
             """
-            """
+
             self._save_model_outputs(
-                dataset=loader.dataset, idx=idx, save_dir='synth_fix_testing',
+                dataset=loader.dataset, idx=idx, save_dir='synth_examples_20260903',
                 data_dict={
                     'Input': X,
                     'Target': utils.replace_labels(
@@ -705,7 +707,7 @@ class SynthUCNet:
             print(synth_class, loader.dataset.outbases[idx])
             if self.current_step == 5:
                 exit()
-            """
+
 
             # Run model
             if self.unet_optimizer is not None:
@@ -733,7 +735,7 @@ class SynthUCNet:
                 self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
                 else (None, None)
             )
-            
+
             # Compute losses
             loss = 0.
             if self.seg_loss is not None:
@@ -750,7 +752,14 @@ class SynthUCNet:
                 )
                 loss += loss_class
                 loss_avg += loss.item()
-            
+
+            if self.class_loss is not None:
+                correct_idx = [self.synth_classes.index(x) for x in [synth_class]]
+                out_idx = torch.argmax(torch.softmax(cnet_logits, dim=1), dim=1)
+                accuracy += torch.tensor(
+                    [x == y for x, y in zip(out_idx, correct_idx)]
+                ).sum().item()
+
             """
             # Write data?
             y = utils.replace_labels(
@@ -780,11 +789,10 @@ class SynthUCNet:
                 fstr += f' {loss_seg.item():>.4f},' if self.seg_loss is not None else ''
                 fstr += f' {loss_class.item():>.4f},' if self.class_loss is not None else ''
             fstr += f' {loss.item():>.4f}, ({synth_class}),'
-            #print(fstr, cnet_logits.data)
-            """
+            
             if (self.current_epoch_step + 1) % 10 == 0:
                 breakpoint()
-            """
+
             if (self.current_epoch_step + 1) % self.print_loss_every == 0:
                 fstr = f'{(self.current_epoch + 1):>5} {(self.current_epoch_step + 1):>4}'
                 if self.multiple_losses:
@@ -793,6 +801,9 @@ class SynthUCNet:
                         if self.unet_change_loss is not None else ''
                     fstr += f' {loss_class.item():>.4f}' if self.class_loss is not None else ''
                 fstr += f' {loss.item():>.4f}'
+
+                current_accuracy = accuracy / (self.current_epoch_step + 1)
+                fstr += f' {current_accuracy:>.4f}' if self.class_loss is not None else ''
                 print(fstr)
 
                 if self.train_log is not None:
@@ -894,7 +905,7 @@ class SynthUCNet:
                     self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
                     else (None, None)
                 )
-                
+
             # Compute losses
             loss = 0.
 

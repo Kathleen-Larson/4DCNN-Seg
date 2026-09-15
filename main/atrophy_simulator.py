@@ -318,7 +318,7 @@ class SynthLongitudinal(nn.Module):
 
         X, y = self.labels_to_image(y, intensities_dict)  # X is the image, y is the label map
         y = self._replace_labels(y)
-        
+
         if 0:
             y1 = torch.clone(y)
             import freesurfer as fs
@@ -753,10 +753,11 @@ class _ResizeLabels(nn.Module):
         Applies a dropout filter to an input mask (adds variability to the label boundaries during
         dilation/erosion)
         """
-        M[M.nonzero(as_tuple=True)] = torch.where(
-            torch.rand((int(M.sum())), dtype=M.dtype, device=M.device) > dr,
-            M[M.nonzero(as_tuple=True)], 0.
-        )
+        idxs = M.nonzero(as_tuple=False)
+        n = int(M.sum())
+        k = min(int(dr * n), n)
+        M[tuple(idxs[torch.randperm(n, device=M.device)[:k]].T)] = 0        
+
         return M
 
     def _is_adjacent(self, x, label1, label2):
@@ -781,7 +782,6 @@ class _ResizeLabels(nn.Module):
                 x[M_bdr] = nbr
         return x
 
-
     def _resize_labels(self, x, sdict):
         """
         Main function to resize the labels specified in sdict
@@ -792,7 +792,7 @@ class _ResizeLabels(nn.Module):
             trg_change = sdict[label][0]
             vol_change = 0.
             it = 0
-            
+
             # Set up neighbor and target masks
             nbr_list = sdict[label][1:]
             M_nbr = torch.zeros(x.shape, device=x.device).float()
@@ -807,17 +807,17 @@ class _ResizeLabels(nn.Module):
             M_trg_orig = M_trg.clone()
 
             # Iteratively resize by 1 voxel boundary at a time
-            while abs(vol_change) < abs(trg_change) and it < 100:                
+            while abs(vol_change) < abs(trg_change) and it < 100:
                 if trg_change > 0:
                     # Get mask for outward boundary shift
                     M_shift = dilate_binary_mask(M_trg, self.dilation_conv) * M_nbr
                     if self.dropout_rate > 0.:
                         M_shift = self._apply_dropout_to_mask(M_shift, self.dropout_rate)
-                    
+
                     # Make sure we did not overshoot change
                     vol_change = ((M_trg + M_shift).sum() / M_trg_orig.sum()) - 1
                     if vol_change > trg_change:
-                        dr = (abs(vol_change) - abs(trg_change)) / vol_change
+                        dr = abs(vol_change - trg_change) * M_trg_orig.sum() / M_shift.sum()
                         M_shift = self._apply_dropout_to_mask(M_shift, dr)
                         vol_change = ((M_trg + M_shift).sum() / M_trg_orig.sum()) - 1
 
@@ -827,27 +827,24 @@ class _ResizeLabels(nn.Module):
 
                     # Replace in original label map
                     x = torch.where(M_shift.bool(), label, x)
-                    
+
                 elif trg_change < 0:
                     # Get mask for inward boundary shift
                     M_shift = dilate_binary_mask(M_nbr, self.dilation_conv) * M_trg
                     if self.dropout_rate > 0.:
                         M_shift = self._apply_dropout_to_mask(M_shift, self.dropout_rate)
-                        
+
                     # Make sure we did not overshoot change
                     vol_change = ((M_trg - M_shift).sum() / M_trg_orig.sum()) - 1
                     if vol_change < trg_change:
-                        dr = (abs(trg_change) - abs(vol_change)) / vol_change
+                        dr = abs(vol_change - trg_change) * M_trg_orig.sum() / M_shift.sum()
                         M_shift = self._apply_dropout_to_mask(M_shift, dr)
                         vol_change = ((M_trg - M_shift).sum() / M_trg_orig.sum()) - 1
-                    
+
                     #  Shift boundary
                     M_nbr += M_shift
                     M_trg -= M_shift
 
-                    if label == 2016:
-                        breakpoint()
-                    
                     # Replace in original label map
                     x = self._replace_boundary(x, M_shift.bool(), nbr_list, label)
 
@@ -856,7 +853,8 @@ class _ResizeLabels(nn.Module):
             # if debug:
             vc = vol_change
             tvc = trg_change
-            print(f'label {label}: vol_change {vc:.4f}, requested {tvc:.4f} in {it} iters')
+            if label == 4 or label == 43:
+                print(f'label {label}: vol_change {vc:.4f}, requested {tvc:.4f} in {it} iters')
 
             out_dict[label] = [vol_change] + nbr_list
 
@@ -902,7 +900,7 @@ class _ResizeLabels(nn.Module):
     def forward(self, x):
         sdict = self._configure_sdict()
         x, odict = self._resize_labels(x, sdict)
-        breakpoint()
+
         return (x, odict) if self.return_dict else x
 
 
@@ -988,7 +986,7 @@ def _config_synth_models(
     for label, neighbors in slist_neighbors_config.items():
         key = search_lut(synth_image_lut, label)[0]
         slist_neighbors[key] = [
-            0 if 'CSF' in neighbor and 'ctx' in label # specific to aseg/aparc labels
+            0 if 'CSF' in neighbor and 'ctx' in label  # specific to aseg/aparc labels
             else search_lut(synth_image_lut, neighbor)[0]
             for neighbor in neighbors
         ]
@@ -1012,7 +1010,7 @@ def _config_synth_models(
             **kwargs
         )
         synth_models['DiseaseClasses'][_class] = synth_model
-        
+
     # Add control class?
     if control_prob > 0:
         synth_models['Control'] = SynthLongitudinal(
