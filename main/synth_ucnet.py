@@ -13,6 +13,7 @@ import yaml
 import pathlib as Path
 import numpy as np
 import surfa as sf
+import pandas as pd
 
 import torch
 import torch.optim
@@ -78,7 +79,7 @@ def main(pargs):
         do_synth=do_synth,
         **config['dataset']
     )
-    if 'train' in datasets:
+    if 'train' in datasets or do_synth:
         if config['training'].get('steps_per_epoch') is not None:
             n_train_samples = config['training']['steps_per_epoch']
         else:
@@ -102,19 +103,22 @@ def main(pargs):
     loaders = {}
     for key in datasets:
         loaders[key] = (
-            _random_DL(datasets[key], config['dataloader']) if key == 'train'
+            _random_DL(datasets[key], config['dataloader'])
+            if key == 'train' or (key == 'test' and do_synth and len(datasets['test']) == 1)
             else DataLoader(datasets[key], **config['dataloader']) if not debug_mode
             else _random_DL(datasets[key], config['dataloader'], num_samples=2)
         )
 
     # Print out dataset info
-    n_test = len(datasets['test']) if 'test' in datasets else 0
-    n_train = len(datasets['train']) if 'train' in datasets else 0
-    n_valid = len(datasets['valid']) if 'valid' in datasets else 0
-
     ref_dataset = 'train' if 'train' in datasets else 'test'
-
-    fstr = f'Train: {n_train} | Valid: {n_valid} | Test: {n_test}'
+    fstr = (
+        f'Train: {len(datasets["train"]) if "train" in datasets else 0}' +
+        f' ({len(loaders["train"]) if "train" in loaders else 0}) | ' +
+        f'Valid: {len(datasets["valid"]) if "valid" in datasets else 0} ' +
+        f' ({len(loaders["valid"]) if "valid" in loaders else 0}) | ' +
+        f'Test: {len(datasets["test"]) if "test" in datasets else 0}' +
+        f' ({len(loaders["test"]) if "test" in loaders else 0})'
+    )
     bffr = '-' * (len(fstr) + 2)
     print(f'{bffr}\n {fstr}\n{bffr}')
 
@@ -162,6 +166,11 @@ def main(pargs):
         0 if config.get('ucnet_transfer_index') is None
         else config.get('ucnet_transfer_index')
     )
+    use_logits_diff = (
+        config['training'].get('take_unet_logits_change')
+        if config['training'].get('take_unet_logits_change') is not None
+        else False
+    )
 
     unet = UNetLong(
         in_channels=n_inputs,
@@ -169,12 +178,21 @@ def main(pargs):
         T=n_timepoints,
         X=n_image_dims,
         L=transfer_index,
-        return_multiple=(True if do_cnet and not do_fine_tuning else False),
+        return_multiple=False, #(True if do_cnet and not do_fine_tuning else False),
         **config['unet']
     ).to(device2 if do_cnet else device) if do_unet else None
 
     cnet = CNetLong(
-        in_channels=unet.n_transfer_features,
+        in_channels=(
+            n_labels * (n_timepoints - 1)
+            if config.get('training').get('take_unet_logits_change')
+            else n_labels * n_timepoints
+            #unet.n_transfer_features if unet is not None
+            #else n_labels * (n_timepoints - 1)
+            #if config.get('training').get('take_unet_logits_change')
+            #else n_labels * n_timepoints 
+            #"""
+        ),
         out_channels=n_labels,
         out_classes=n_classes,
         in_shape=datasets.get(ref_dataset).data_shape,
@@ -193,7 +211,7 @@ def main(pargs):
         return_multiple=(True if do_cnet else False),
         **config['fine_tune_layers']
     ).to(device) if do_fine_tuning else None
-
+    
     # Load checkpoints?
     load_unet = False
     resume_unet_path = os.path.join(output_dir, 'model_last_unet.pth')
@@ -300,29 +318,29 @@ def main(pargs):
         0 if not resume_training and not infer_only
         else fine_tune_epoch if load_fine_tune
         else max(unet_epoch, cnet_epoch) if load_unet and load_cnet
-        else unet_epoch if do_unet and not do_cnet and load_unet
         else cnet_epoch if do_cnet and not do_unet and load_cnet
+        else unet_epoch if do_unet and not do_cnet and load_unet
         else 0
     )
     start_step = (
         0 if not resume_training and not infer_only
         else fine_tune_checkpoint['step'] if start_epoch == fine_tune_epoch and load_fine_tune
-        else unet_checkpoint['step'] if start_epoch == unet_epoch and load_unet
         else cnet_checkpoint['step'] if start_epoch == cnet_epoch and load_cnet
+        else unet_checkpoint['step'] if start_epoch == unet_epoch and load_unet
         else 0
     )
     start_train_loss = (
         None if not resume_training and not infer_only
         else fine_tune_checkpoint['train_loss'] if start_epoch == fine_tune_epoch and load_fine_tune
-        else unet_checkpoint['train_loss'] if start_epoch == unet_epoch and load_unet
         else cnet_checkpoint['train_loss'] if start_epoch == cnet_epoch and load_cnet
+        else unet_checkpoint['train_loss'] if start_epoch == unet_epoch and load_unet
         else None
     )
     start_valid_loss = (
         None if not resume_training and not infer_only
         else fine_tune_checkpoint['valid_loss'] if start_epoch == fine_tune_epoch and load_fine_tune
+        else cnet_checkpoint['valid_loss'] if start_epoch == cnet_epoch and load_cnet
         else unet_checkpoint['valid_loss'] if start_epoch == unet_epoch and load_unet
-        else unet_checkpoint['valid_loss'] if start_epoch == cnet_epoch and load_cnet
         else None
     )
 
@@ -366,10 +384,10 @@ def main(pargs):
         # Generate loss figures
         if trainer.train_log is not None and loaders.get('train') is not None:
             trainer._plot_loss(loss_type='train')
-
+            
         if trainer.valid_log is not None and loaders.get('valid') is not None:
             trainer._plot_loss(loss_type='valid')
-
+    
     # Run inference
     if 'test' in loaders:
         trainer._predict(
@@ -446,6 +464,9 @@ class SynthUCNet:
             steps_per_epoch=None,
             switch_loss_weights_after=None,
             take_abs_change=False,
+            take_unet_logits_change=False,
+            take_log_abs_change=False,
+            use_structure_volumes=False,
             device2=None,
             device=None,
             **kwargs
@@ -487,6 +508,9 @@ class SynthUCNet:
         self.save_outputs_every = save_outputs_every
         self.steps_per_epoch = steps_per_epoch
         self.take_abs_change = take_abs_change
+        self.take_unet_logits_change = take_unet_logits_change
+        self.take_log_abs_change = take_log_abs_change
+        self.use_structure_volumes = use_structure_volumes
 
         self.current_epoch = start_epoch
         self.current_step = start_step
@@ -495,7 +519,7 @@ class SynthUCNet:
         # Losses
         self.seg_loss = None
         self.class_loss = None
-        self.unet_change_loss = None
+        self.change_loss = None
 
         self.seg_loss_kwargs = loss_funcs.get('seg')
         if self.seg_loss_kwargs is not None:
@@ -507,24 +531,24 @@ class SynthUCNet:
             self.class_loss = eval(f'loss_functions.{self.class_loss_kwargs.get("name")}')
             self.class_loss_kwargs.pop('name')
 
-        self.unet_change_loss_kwargs = loss_funcs.get('unet_change')
-        if self.unet_change_loss_kwargs is not None:
-            self.unet_change_loss = eval(
-                f'loss_functions.{self.unet_change_loss_kwargs.get("name")}'
+        self.change_loss_kwargs = loss_funcs.get('change')
+        if self.change_loss_kwargs is not None:
+            self.change_loss = eval(
+                f'loss_functions.{self.change_loss_kwargs.get("name")}'
             )
-            self.unet_change_loss_kwargs.pop('name')
+            self.change_loss_kwargs.pop('name')
 
         self.multiple_losses = (
             (self.seg_loss is not None)
             + (self.class_loss is not None)
-            + (self.unet_change_loss is not None)
+            + (self.change_loss is not None)
         ) > 1
 
         if loss_weights is not None and len(loss_weights) > 1:
             self.loss_weights = loss_weights
             self.seg_loss_kwargs['weight'] = self.loss_weights[0][0]
             self.class_loss_kwargs['weight'] = self.loss_weights[0][1]
-            self.unet_change_loss_kwargs['weight'] = self.loss_weights[0][2]
+            #self.change_loss_kwargs['weight'] = self.loss_weights[0][2]
 
             if switch_loss_weights_after is None:
                 utils.arg_error('Must specify switch_loss_weights_after if using multiple loss '
@@ -619,7 +643,7 @@ class SynthUCNet:
 
             log_str = ''
             log_str += 'seg_loss ' if self.seg_loss is not None else ''
-            log_str += 'unet_change_loss ' if self.unet_change_loss is not None else ''
+            log_str += 'change_loss ' if self.change_loss is not None else ''
             log_str += 'class_loss ' if self.class_loss is not None else ''
             log_str += 'total_loss ' if self.multiple_losses else ''
             log_str += 'accuracy' if self.class_loss is not None else ''
@@ -667,18 +691,23 @@ class SynthUCNet:
             # Synthesize images from input volume (?)
             if self.synthesizer is not None:
                 control_prob = self.synthesizer.get('control_prob')
-                prob = random.uniform(0., 1.)
-
                 synth_class, synth_model = (
                     ('Control', self.synthesizer.get('Control'))
-                    if control_prob is not None and prob < control_prob
+                    if control_prob is not None and random.uniform(0., 1.) < control_prob
                     else random.choice(list(self.synthesizer['DiseaseClasses'].items()))
                 )
+                if synth_model.return_sdict:
+                    X, y, sdict = synth_model(
+                        [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
+                        else [y.to(synth_model.device)]
+                    )
+                else:
+                    X, y = synth_model(
+                        [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
+                        else [y.to(synth_model.device)]
+                    )
+                    sdict = None
 
-                X, y = synth_model(
-                    [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
-                    else [y.to(synth_model.device)]
-                )
 
             X, y = augmentations([X, y]) if augmentations is not None else y
 
@@ -692,7 +721,7 @@ class SynthUCNet:
                 loader.dataset, 'target', idx, save_dir='examples'
             )
             """
-
+            """
             self._save_model_outputs(
                 dataset=loader.dataset, idx=idx, save_dir='synth_examples_20260903',
                 data_dict={
@@ -707,8 +736,7 @@ class SynthUCNet:
             print(synth_class, loader.dataset.outbases[idx])
             if self.current_step == 5:
                 exit()
-
-
+            """
             # Run model
             if self.unet_optimizer is not None:
                 self.unet_optimizer.zero_grad()
@@ -717,35 +745,68 @@ class SynthUCNet:
             if self.fine_tune_optimizer is not None:
                 self.fine_tune_optimizer.zero_grad()
 
-            if self.fine_tune_layers is not None:
-                unet_output_initial, skip_conn = self.unet(X.to(self.device))
-                unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
-                cnet_input = unet_output_initial
+            if self.unet is None:
+                # Use ground truth labels
+                cnet_input = y
+                unet_logits = None
             else:
-                unet_output = (
-                    self.unet(X.to(self.device)) if self.unet is not None
-                    else y.to(self.device2)
-                )
-                if isinstance(unet_output, (list, tuple)) and len(unet_output) > 1:
-                    unet_logits, cnet_input = unet_output
+                if self.fine_tune_layers is not None:
+                    # Do unet + fine tuning layer
+                    unet_output_initial, skip_conn = self.unet(X.to(self.device))
+                    unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
+                    cnet_input = unet_output_initial
                 else:
-                    unet_logits = cnet_input = unet_output
+                    # Unet only
+                    unet_output = (
+                        self.unet(X.to(self.device)) if self.unet is not None
+                        else y.to(self.device2)
+                    )
+                    if isinstance(unet_output, (list, tuple)) and len(unet_output) > 1:
+                        unet_logits, cnet_input = unet_output
+                    else:
+                        unet_logits = cnet_input = unet_output
 
-            cnet_logits, _ = (
-                self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
-                else (None, None)
-            )
+                # Get posteriors as cnet input
+                cnet_input = F.softmax(unet_logits, dim=1)
+                unet_logits = torch.stack(cnet_input.chunk(y.shape[2], dim=1), dim=2)
+                
+            if self.cnet is not None:
+                if self.use_structure_volumes:
+                    cnet_input = cnet_input.reshape(*cnet_input.shape[0:3], -1).sum(dim=-1)
+                    cnet_input = cnet_input / cnet_input[..., 0].unsqueeze(dim=-1)
+                    cnet_input[cnet_input.isnan() | cnet_input.isinf()] = 0.
+
+                    if self.take_unet_logits_change:
+                        cnet_input = cnet_input.diff(dim=-1).squeeze(dim=-1)
+                        cnet_input = cnet_input.abs() if self.take_abs_change else cnet_input
+                        cnet_input = (
+                            (cnet_input.abs() + 1).log() if self.take_log_abs_change else cnet_input
+                        )                    
+                    else:
+                        cnet_input = cnet_input.reshape(cnet_input.shape[0], -1)
+                else:
+                    cnet_input = (
+                        torch.cat([cnet_input[:, :, t, ...] for t in range(y.shape[2])], dim=1)
+                        if not self.take_unet_logits_change
+                        else cnet_input.diff(dim=2).squeeze(dim=2) if not self.take_abs_change
+                        else cnet_input.diff(dim=2).squeeze(dim=2).abs()
+                    )
+
+                cnet_logits, _ = (
+                    self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
+                    else (None, None)
+                )
 
             # Compute losses
             loss = 0.
             if self.seg_loss is not None:
                 loss_seg = self.seg_loss(unet_logits, y, **self.seg_loss_kwargs)
                 loss += loss_seg.to(self.device2)
-            if self.unet_change_loss is not None:
-                loss_unet_change = self.unet_change_loss(
-                    unet_logits, y, **self.unet_change_loss_kwargs
+            if self.change_loss is not None:
+                loss_change = self.change_loss(
+                    y if unet_logits is None else unet_logits, y, **self.change_loss_kwargs
                 )
-                loss += loss_unet_change.to(self.device2)
+                loss += loss_change.to(self.device2)
             if self.class_loss is not None:
                 loss_class = self.class_loss(
                     cnet_logits, synth_class, self.synth_classes, **self.class_loss_kwargs
@@ -759,9 +820,9 @@ class SynthUCNet:
                 accuracy += torch.tensor(
                     [x == y for x, y in zip(out_idx, correct_idx)]
                 ).sum().item()
-
-            """
+                
             # Write data?
+            """
             y = utils.replace_labels(
                 torch.argmax(y, dim=1, keepdims=True),
                 labels_out=[x for x in loader.dataset.out_lut.keys()],
@@ -774,31 +835,30 @@ class SynthUCNet:
             )
             print(f'Writing data for {loader.dataset.outbases[idx]}')
             self._save_model_outputs(
-                dataset=loader.dataset, idx=idx, save_dir='synth_fix_testing',
-                data_dict={'Input': X, 'Target': y, 'Posteriors': None, 'Output': seg}
+                dataset=loader.dataset, idx=idx, save_dir='include_ctx',
+                data_dict={'Input': X, 'Target': y, 'Posteriors': None, 'Output': None}
             )
             predicted_class = self.synth_classes[
                 torch.argmax(torch.softmax(cnet_logits, dim=1), dim=1)
             ]
             print(f'Class: {synth_class}, predicted: {predicted_class}')        
             breakpoint()
-
             """
             fstr = f'{(self.current_epoch + 1):>5}, {(self.current_epoch_step + 1):>4},'
             if self.multiple_losses:
                 fstr += f' {loss_seg.item():>.4f},' if self.seg_loss is not None else ''
                 fstr += f' {loss_class.item():>.4f},' if self.class_loss is not None else ''
             fstr += f' {loss.item():>.4f}, ({synth_class}),'
-            
+            """
             if (self.current_epoch_step + 1) % 10 == 0:
                 breakpoint()
-
+            """
             if (self.current_epoch_step + 1) % self.print_loss_every == 0:
                 fstr = f'{(self.current_epoch + 1):>5} {(self.current_epoch_step + 1):>4}'
                 if self.multiple_losses:
                     fstr += f' {loss_seg.item():>.4f}' if self.seg_loss is not None else ''
-                    fstr += f' {loss_unet_change.item():>.4f}' \
-                        if self.unet_change_loss is not None else ''
+                    fstr += f' {loss_change.item():>.4f}' \
+                        if self.change_loss is not None else ''
                     fstr += f' {loss_class.item():>.4f}' if self.class_loss is not None else ''
                 fstr += f' {loss.item():>.4f}'
 
@@ -870,10 +930,18 @@ class SynthUCNet:
                     else random.choice(list(self.synthesizer['DiseaseClasses'].items()))
                 )
 
-                X, y = synth_model(
-                    [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
-                    else [y.to(synth_model.device)]
-                )
+                if synth_model.return_sdict:
+                    X, y, sdict = synth_model(
+                        [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
+                        else [y.to(synth_model.device)]
+                    )
+                else:
+                    X, y = synth_model(
+                        [yi.to(synth_model.device) for yi in y] if isinstance(y, (list, tuple))
+                        else [y.to(synth_model.device)]
+                    )
+                    sdict = None
+            
             elif isinstance(y, tuple):
                 # Data is both image and labels
                 X, y = y
@@ -883,55 +951,102 @@ class SynthUCNet:
                 y = None
 
             X, y = augmentations([X, y]) if augmentations is not None else (X, y)
-
+            
             # Run model
             with torch.no_grad():
-                if self.fine_tune_layers is not None:
-                    unet_output_initial, skip_conn = self.unet(X.to(self.device))
-                    unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
-                    cnet_input = unet_output_initial
-
-                else:                    
-                    unet_output = (
-                        self.unet(X.to(self.device)) if self.unet is not None
-                        else y.to(self.device2)
-                    )
+                if self.unet is None:
+                    # Use ground truth labels
+                    cnet_input = y
+                    unet_logits = None
+                else:
+                    if self.fine_tune_layers is not None:
+                        # Do unet + fine tuning layer
+                        unet_output_initial, skip_conn = self.unet(X.to(self.device))
+                        unet_logits, _ = self.fine_tune_layers(unet_output_initial, skip_conn)
+                        cnet_input = unet_output_initial
+                    else:
+                        # Unet only
+                        unet_output = (
+                            self.unet(X.to(self.device)) if self.unet is not None
+                            else y.to(self.device2)
+                        )
                     if isinstance(unet_output, (list, tuple)) and len(unet_output) > 1:
                         unet_logits, cnet_input = unet_output
                     else:
                         unet_logits = cnet_input = unet_output
 
-                cnet_logits, change_map = (
-                    self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
-                    else (None, None)
-                )
+                    # Get posteriors as cnet input
+                    cnet_input = F.softmax(unet_logits, dim=1)
+                
+                if self.cnet is not None:
+                    if self.use_structure_volumes:
+                        cnet_input = cnet_input.reshape(*cnet_input.shape[0:3], -1).sum(dim=-1)
+                        cnet_input = cnet_input / cnet_input[..., 0].unsqueeze(dim=-1)
+                        cnet_input[cnet_input.isnan() | cnet_input.isinf()] = 0.
 
-            # Compute losses
-            loss = 0.
+                        if self.take_unet_logits_change:
+                            cnet_input = cnet_input.diff(dim=-1).squeeze(dim=-1)
+                            cnet_input = cnet_input.abs() if self.take_abs_change else cnet_input
+                            cnet_input = (
+                                (cnet_input.abs() + 1).log() if self.take_log_abs_change
+                                else cnet_input
+                            )
+                        else:
+                            cnet_input = cnet_input.reshape(cnet_input.shape[0], -1)
+                    else:
+                        cnet_input = (
+                            torch.cat([cnet_input[:, :, t, ...] for t in range(y.shape[2])], dim=1)
+                            if not self.take_unet_logits_change
+                            else cnet_input.diff(dim=2).squeeze(dim=2) if not self.take_abs_change
+                            else cnet_input.diff(dim=2).squeeze(dim=2).abs()
+                        )
 
-            if self.seg_loss is not None:
-                loss_seg = self.seg_loss(unet_logits, y, **self.seg_loss_kwargs)
-                loss += loss_seg.to(self.device2)
-                avg_seg_loss += loss_seg.item()
-            if self.unet_change_loss is not None:
-                loss_unet_change = self.unet_change_loss(
-                    unet_logits, y, **self.unet_change_loss_kwargs
-                )
-                loss += loss_unet_change.to(self.device2)
-            if self.class_loss is not None:
-                loss_class = self.class_loss(
-                    cnet_logits, synth_class, self.synth_classes, **self.class_loss_kwargs
-                )
-                loss += loss_class
-            loss_avg += loss.item()
+                    cnet_logits, _ = (
+                        self.cnet(cnet_input.to(self.device2)) if self.cnet is not None
+                        else (None, None)
+                    )
 
-            # Log if classifier is correct
-            if self.class_loss is not None:
-                correct_idx = [self.synth_classes.index(x) for x in [synth_class]]
-                out_idx = torch.argmax(torch.softmax(cnet_logits, dim=1), dim=1)
-                accuracy += torch.tensor(
-                    [x == y for x, y in zip(out_idx, correct_idx)]
-                ).sum().item()
+                """
+                self._save_model_outputs(
+                dataset=loader.dataset, idx=idx, save_dir='synth_example_predict_20260929',
+                data_dict={
+                    'Input': X,
+                'Target': utils.replace_labels(
+                        torch.argmax(y, dim=1, keepdims=True),
+                        labels_out=[x for x in loader.dataset.out_lut.keys()],
+                        labels_in=[x for x in np.arange(0, len(loader.dataset.out_lut.keys()))]
+                    )
+                }
+                )
+                """
+
+                # Compute losses
+                loss = 0.
+
+                if self.seg_loss is not None:
+                    loss_seg = self.seg_loss(unet_logits, y, **self.seg_loss_kwargs)
+                    loss += loss_seg.to(self.device2)
+                    avg_seg_loss += loss_seg.item()
+                if self.change_loss is not None:
+                    loss_change = self.change_loss(
+                        y if unet_logits is None else unet_logits, y, **self.change_loss_kwargs
+                    )
+                    loss += loss_change.to(self.device2)
+
+                if self.class_loss is not None:
+                    loss_class = self.class_loss(
+                        cnet_logits, synth_class, self.synth_classes, **self.class_loss_kwargs
+                    )
+                    loss += loss_class
+                loss_avg += loss.item()
+
+                # Log if classifier is correct
+                if self.class_loss is not None:
+                    correct_idx = [self.synth_classes.index(x) for x in [synth_class]]
+                    out_idx = torch.argmax(torch.softmax(cnet_logits, dim=1), dim=1)
+                    accuracy += torch.tensor(
+                        [x == y for x, y in zip(out_idx, correct_idx)]
+                    ).sum().item()
 
             # Write outputs?
             if loss_type == 'test':
@@ -942,13 +1057,14 @@ class SynthUCNet:
                         labels_in=[x for x in np.arange(0, len(loader.dataset.out_lut.keys()))]
                     )
 
-                    posts = torch.softmax(unet_logits, dim=1)
+                    posts = torch.softmax(unet_logits, dim=1) if self.unet else None
 
                     seg = utils.replace_labels(
                         torch.argmax(posts, dim=1, keepdims=True),
                         labels_out=[x for x in loader.dataset.out_lut.keys()],
                         labels_in=[x for x in np.arange(0, len(loader.dataset.out_lut.keys()))]
-                    )
+                    ) if self.unet else None
+                    
                     self._save_model_outputs(
                         dataset=loader.dataset, idx=idx,
                         save_dir=f'model_outputs_epoch{self.current_epoch}',
@@ -957,7 +1073,8 @@ class SynthUCNet:
                             'Input': X if write_inputs else None,
                             'Target': y if write_targets else None,
                             'Posteriors': posts if write_posteriors else None,
-                            'Output': seg
+                            'Output': seg,
+                            'sdict': sdict,
                         },
                     )
 
@@ -971,7 +1088,7 @@ class SynthUCNet:
                             f'{loss_seg.item():>.4f} ' if self.seg_loss is not None else ''
                         )
                         fstr += (
-                            f'{loss_unet_change.item():>.4f} ' if self.unet_change_loss is not None
+                            f'{loss_change.item():>.4f} ' if self.change_loss is not None
                             else ''
                         )
                         fstr += (
@@ -992,7 +1109,7 @@ class SynthUCNet:
         fstr = ''
         if self.multiple_losses:
             fstr += f'{loss_seg.item():>.4f} ' if self.seg_loss is not None else ''
-            fstr += f'{loss_unet_change.item():>.4f} ' if self.unet_change_loss is not None else ''
+            fstr += f'{loss_change.item():>.4f} ' if self.change_loss is not None else ''
             fstr += f'{loss_class.item():>.4f} ' if self.class_loss is not None else ''
 
         fstr += f'{loss.item():>.4f}'
@@ -1063,9 +1180,10 @@ class SynthUCNet:
             if self.current_epoch == self.switch_loss_weights_after:
                 self.seg_loss_kwargs['weight'] = self.loss_weights[1][0]
                 self.class_loss_kwargs['weight'] = self.loss_weights[1][1]
-                self.unet_change_loss_kwargs['weight'] = self.loss_weights[1][2]
+                #self.change_loss_kwargs['weight'] = self.loss_weights[1][2]
 
     def _save_model_outputs(self, data_dict, dataset, idx, save_dir=None, make_subdir=False):
+        # Set up
         nB, _, nT = (
             data_dict.get('Output').shape[:3] if data_dict.get('Output') is not None
             else data_dict.get('Target').shape[:3] if data_dict.get('Target') is not None
@@ -1079,6 +1197,21 @@ class SynthUCNet:
             if save_dir is None else save_dir
         )
 
+        # Save sdict
+        if data_dict.get('sdict'):
+            sdict = data_dict.get('sdict')[0]
+            output = np.zeros((len(sdict), 2))
+            for n, (key, val) in enumerate(sdict.items()):
+                output[n] = [key, val[0].item()]
+            output = output[output[:, 0].argsort()]
+                
+            fname = os.path.join(
+                save_dir, f'{dataset.outbases[idx]}' if make_subdir else '', 'sdict.txt'
+            )
+            os.makedirs(os.path.dirname(fname), exist_ok=True)
+            np.savetxt(fname, output, ('%.0f %.5f'))
+            
+        # Write images
         for t in range(nT):
             outbase = f'{dataset.outbases[idx]}.timepoint{t}'
             if data_dict.get('Input') is not None:

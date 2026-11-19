@@ -68,11 +68,11 @@ class BaseDataset(Dataset):
             else aug.AssignOneHotLabels(label_values=[x for x in self.out_lut], X=self.X)
         ]
         aug_list_partial = aug_list_full.copy()
-        
+
         if aug_config.get('_functions') is not None:
             aug_config['_train'] = aug_config['_functions']
             aug_config['_infer'] = aug_config['_functions']
-            
+
         if aug_config.get('_train') is not None:
             for func, config in aug_config['_train'].items():
                 config['X'] = self.X
@@ -167,7 +167,7 @@ class BaseDataset(Dataset):
         basename = '.'.join([outbase, 'mgz'])
         outdir = os.path.join(outdir, self.subject_ids[idx]) if make_subdir else outdir
         os.makedirs(outdir, exist_ok=True)
-        #breakpoint()
+        # breakpoint()
         if self.resample:
             while len(img.shape) < self.X + 3:
                 img = img.unsqueeze(dim=1)

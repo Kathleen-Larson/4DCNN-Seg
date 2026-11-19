@@ -24,7 +24,7 @@ class UNetLong(nn.Module):
             n_levels=4,
             n_starting_features=64,
             norm_func='InstanceNorm',
-            return_multiple=True,
+            return_multiple=False,
             return_second_to_last_output=False,
             skip_last_level=False,
             use_residuals=False,
@@ -159,11 +159,12 @@ class CNetLong(nn.Module):
             conv_kernel_size=3,
             conv_kernel_shape=None,
             do_MLP=False,
+            do_spatial_encoding=True,
             down_func='maxpool',
             down_kernel_size=2,
             dropout_rate=0,
             feature_ratio=1.2,
-            model_type=3,
+            model_type=1,
             n_convs_per_block=2,
             n_levels=4,
             n_starting_features=64,
@@ -184,78 +185,35 @@ class CNetLong(nn.Module):
         self.out_channels = out_channels
 
         self.do_MLP = do_MLP
+        self.do_spatial_encoding = do_spatial_encoding
         self.model_type = model_type
         self.n_levels = n_levels
         self.use_residuals = False
         self.use_skips = True
 
-        conv_block_kwargs = {
-            'activ_func': _parse_arg_as_function(self, activ_func),
-            'norm_func': _parse_arg_as_function(self, norm_func),
-            'conv_kernel_size': _parse_arg_as_list(self, conv_kernel_size, int),
-            'dropout_rate': dropout_rate,
-            'X': self.X,
-            'T': self.T
-        }
-        f_config = [
-            math.ceil(in_channels * (feature_ratio ** n)) for n in range(self.n_levels + 1)
-        ]
-        enc = f_config[:-1]
-        dec = f_config[1:]
+        if self.do_spatial_encoding:
+            conv_block_kwargs = {
+                'activ_func': _parse_arg_as_function(self, activ_func),
+                'norm_func': _parse_arg_as_function(self, norm_func),
+                'conv_kernel_size': _parse_arg_as_list(self, conv_kernel_size, int),
+                'dropout_rate': dropout_rate,
+                'X': self.X,
+                'T': self.T
+            }
+            f_config = [
+                int(in_channels * (feature_ratio ** n)) for n in range(self.n_levels + 1)
+            ]
+            enc = f_config[:-1]
+            dec = f_config[1:]
 
-        # Encoding block
-        self.enc1_block = nn.ModuleList(
-            [_ConvBlock(
-                f_config=([enc[n]] + ([enc[n + 1]] * n_convs_per_block)),
-                **conv_block_kwargs
-            ) for n in range(self.n_levels - 1)]
-        )
-        self.downsample1 = nn.ModuleList(
-            [_Pool(
-                n_features=enc[n + 1],
-                pool_type='Max',
-                kernel_size=down_kernel_size,
-                X=self.X,
-                T=self.T
-            ) for n in range(self.n_levels - 1)]
-        )
-        self.bottleneck1 = _ConvBlock(
-            f_config=([enc[-1]] + [dec[-1]] * n_convs_per_block),
-            **conv_block_kwargs
-        )
-
-        # Decoding arm
-        if self.model_type > 1:
-            self.dec_block = nn.ModuleList(
-                [_ConvBlock(
-                    f_config=(
-                        [dec[n + 1] + enc[n + 1] if self.use_skips else dec[n + 1]]
-                        + ([dec[n]] * n_convs_per_block)
-                    ),
-                    **conv_block_kwargs
-                ) for n in range(self.n_levels - 1)]
-            )
-            self.upsample = nn.ModuleList(
-                [_UpConv(
-                    n_features=dec[n + 1],
-                    kernel_size=down_kernel_size,
-                    X=X, T=T
-                ) for n in range(self.n_levels - 1)]
-            )
-            self.bottleneck2 = _ConvBlock(
-                f_config=([dec[0]] + [enc[0]] * n_convs_per_block),
-                **conv_block_kwargs
-            )
-
-        # Encoding arm 2
-        if self.model_type > 2:
-            self.enc2_block = nn.ModuleList(
+            # Encoding block
+            self.enc1_block = nn.ModuleList(
                 [_ConvBlock(
                     f_config=([enc[n]] + ([enc[n + 1]] * n_convs_per_block)),
                     **conv_block_kwargs
                 ) for n in range(self.n_levels - 1)]
             )
-            self.downsample2 = nn.ModuleList(
+            self.downsample1 = nn.ModuleList(
                 [_Pool(
                     n_features=enc[n + 1],
                     pool_type='Max',
@@ -264,113 +222,174 @@ class CNetLong(nn.Module):
                     T=self.T
                 ) for n in range(self.n_levels - 1)]
             )
-            self.bottleneck3 = _ConvBlock(
+            self.bottleneck1 = _ConvBlock(
                 f_config=([enc[-1]] + [dec[-1]] * n_convs_per_block),
                 **conv_block_kwargs
             )
 
-        # Final layers
-        self.change_map = _ConvBlock(
-            f_config=[enc[0], out_channels],
-            conv_kernel_size=([1] * (X + 1)),
-            T=T, X=X
-        )
+            # Decoding arm
+            if self.model_type > 1:
+                self.dec_block = nn.ModuleList(
+                    [_ConvBlock(
+                        f_config=(
+                            [dec[n + 1] + enc[n + 1] if self.use_skips else dec[n + 1]]
+                            + ([dec[n]] * n_convs_per_block)
+                        ),
+                        **conv_block_kwargs
+                    ) for n in range(self.n_levels - 1)]
+                )
+                self.upsample = nn.ModuleList(
+                    [_UpConv(
+                        n_features=dec[n + 1],
+                        kernel_size=down_kernel_size,
+                        X=X, T=T
+                    ) for n in range(self.n_levels - 1)]
+                )
+                self.bottleneck2 = _ConvBlock(
+                    f_config=([dec[0]] + [enc[0]] * n_convs_per_block),
+                    **conv_block_kwargs
+                )
 
-        self.flatten = torch.nn.Flatten(1, -1)
-
-        in_shape = in_shape if isinstance(in_shape, (list, tuple)) else in_shape ** self.X
-        final_shape = [x // (2 ** len(self.downsample1)) for x in in_shape]
-        n_in = math.prod(final_shape) * f_config[-1]
-
-        if self.do_MLP:
-            self.final_pool = _Pool(
-                n_features=enc[-1],
-                pool_type='AdaptiveAvg',
-                out_shape=(1, 1, 1),
-                kernel_size=[int(x / (2 ** (4))) for x in in_shape],
-                X=self.X,
-                T=self.T
+            # Encoding arm 2
+            if self.model_type > 2:
+                self.enc2_block = nn.ModuleList(
+                    [_ConvBlock(
+                        f_config=([enc[n]] + ([enc[n + 1]] * n_convs_per_block)),
+                        **conv_block_kwargs
+                    ) for n in range(self.n_levels - 1)]
+                )
+                self.downsample2 = nn.ModuleList(
+                    [_Pool(
+                        n_features=enc[n + 1],
+                        pool_type='Max',
+                        kernel_size=down_kernel_size,
+                        X=self.X,
+                        T=self.T
+                    ) for n in range(self.n_levels - 1)]
+                )
+                self.bottleneck3 = _ConvBlock(
+                    f_config=([enc[-1]] + [dec[-1]] * n_convs_per_block),
+                    **conv_block_kwargs
+                )
+                
+            # Final layers
+            self.change_map = _ConvBlock(
+                f_config=[enc[0], out_channels],
+                conv_kernel_size=([1] * (X + 1)),
+                T=T, X=X
             )
+            
+            self.flatten = torch.nn.Flatten(1, -1)
+            
+            in_shape = in_shape if isinstance(in_shape, (list, tuple)) else in_shape ** self.X
+            final_shape = [x // (2 ** len(self.downsample1)) for x in in_shape]
+            n_in = math.prod(final_shape) * f_config[-1]
+            
+            if self.do_MLP:
+                self.final_pool = _Pool(
+                    n_features=enc[-1],
+                    pool_type='AdaptiveAvg',
+                    out_shape=(1, 1, 1),
+                    kernel_size=[int(x / (2 ** (4))) for x in in_shape],
+                    X=self.X,
+                    T=self.T
+                )
+                self.MLP = _MLPBlock(
+                    f_config=[dec[-1], 128, n_starting_features, out_classes],
+                    activ_func=nn.GELU,  # conv_block_kwargs.get('activ_func'),
+                    norm_func=eval(f'nn.{norm_func}1d'),
+                    do_softmax=False,
+                )
+            else:
+                self.final = _LinearBlock(
+                    f_config=([n_in, out_classes]),
+                    activ_func=conv_block_kwargs.get('activ_func'),
+                    conv_size=conv_block_kwargs.get('conv_kernel_size')[0],
+            )
+
+        else:
             self.MLP = _MLPBlock(
-                f_config=[dec[-1], 128, n_starting_features, out_classes],
+                f_config=[
+                    int(x) for x in torch.linspace(in_channels, out_classes, self.n_levels + 1)
+                ],
                 activ_func=nn.GELU,  # conv_block_kwargs.get('activ_func'),
                 norm_func=eval(f'nn.{norm_func}1d'),
                 do_softmax=False,
-            )
-        else:
-            self.final = _LinearBlock(
-                f_config=([n_in, out_classes]),
-                activ_func=conv_block_kwargs.get('activ_func'),
-                conv_size=conv_block_kwargs.get('conv_kernel_size')[0],
-            )
-
+            )            
+            
     def forward(self, x):
         B = x.shape[0]
         HWD = x.shape[-self.X:]
 
         skips = [None] * (self.n_levels - 1)
         siz = [None] * (self.n_levels - 1)
+        
+        if self.do_spatial_encoding:
+            # Single encoder
+            if self.model_type == 1:
+                y = self.change_map(x).view(B, -1, (self.T - 1), *HWD)
 
-        # Single encoder
-        if self.model_type == 1:
-            y = self.change_map(x).view(B, -1, (self.T - 1), *HWD)
+                for n in range(self.n_levels - 1):
+                    x = self.enc1_block[n](x)
+                    skips[n], siz[n] = (x, x.shape)
+                    x = self.downsample1[n](x)
 
-            for n in range(self.n_levels - 1):
-                x = self.enc1_block[n](x)
-                skips[n], siz[n] = (x, x.shape)
-                x = self.downsample1[n](x)
+                x = self.bottleneck1(x)
 
-            x = self.bottleneck1(x)
+            # Encoder + decoder
+            if self.model_type == 2:
+                for n in range(self.n_levels - 1):
+                    x = self.enc1_block[n](x)
+                    skips[n], siz[n] = (x, x.shape)
+                    x = self.downsample1[n](x)
 
-        # Encoder + decoder
-        if self.model_type == 2:
-            for n in range(self.n_levels - 1):
-                x = self.enc1_block[n](x)
-                skips[n], siz[n] = (x, x.shape)
-                x = self.downsample1[n](x)
+                x = self.bottleneck1(x)
+                y = x
 
-            x = self.bottleneck1(x)
-            y = x
+                for n in reversed(range(self.n_levels - 1)):
+                    y = self.upsample[n](y, siz[n])
+                    y = self.dec_block[n](torch.cat([skips[n], y], dim=1) if self.use_skips else y)
 
-            for n in reversed(range(self.n_levels - 1)):
-                y = self.upsample[n](y, siz[n])
-                y = self.dec_block[n](torch.cat([skips[n], y], dim=1) if self.use_skips else y)
+                y = self.bottleneck2(y)
+                y = self.change_map(y).view(B, -1, (self.T - 1), *HWD)
 
-            y = self.bottleneck2(y)
-            y = self.change_map(y).view(B, -1, (self.T - 1), *HWD)
+            # Encoder + decoder + second encoder
+            if self.model_type == 3:
+                for n in range(self.n_levels - 1):
+                    x = self.enc1_block[n](x)
+                    skips[n], siz[n] = (x, x.shape)
+                    x = self.downsample1[n](x)
 
-        # Encoder + decoder + second encoder
-        if self.model_type == 3:
-            for n in range(self.n_levels - 1):
-                x = self.enc1_block[n](x)
-                skips[n], siz[n] = (x, x.shape)
-                x = self.downsample1[n](x)
+                x = self.bottleneck1(x)
 
-            x = self.bottleneck1(x)
+                for n in reversed(range(self.n_levels - 1)):
+                    x = self.upsample[n](x, siz[n])
+                    x = self.dec_block[n](torch.cat([skips[n], x], dim=1) if self.use_skips else x)
 
-            for n in reversed(range(self.n_levels - 1)):
-                x = self.upsample[n](x, siz[n])
-                x = self.dec_block[n](torch.cat([skips[n], x], dim=1) if self.use_skips else x)
+                x = self.bottleneck2(x)
+                y = self.change_map(x).view(B, -1, (self.T - 1), *HWD)
 
-            x = self.bottleneck2(x)
-            y = self.change_map(x).view(B, -1, (self.T - 1), *HWD)
+                for n in range(self.n_levels - 1):
+                    x = self.enc2_block[n](x)
+                    x = self.downsample2[n](x)
 
-            for n in range(self.n_levels - 1):
-                x = self.enc2_block[n](x)
-                x = self.downsample2[n](x)
+                x = self.bottleneck3(x)
+        
+            # Final classifier layers
+            if self.do_MLP:
+                x = self.final_pool(x)
+                while x.shape[-1] == 1:
+                    x = x.squeeze(dim=-1)
+                x = self.MLP(x)
+            else:
+                x = self.flatten(x)
+                x = self.final(x)
 
-            x = self.bottleneck3(x)
-
-        # Final classifier layers
-        if self.do_MLP:
-            x = self.final_pool(x)
-            while x.shape[-1] == 1:
-                x = x.squeeze(dim=-1)
-            x = self.MLP(x)
         else:
-            x = self.flatten(x)
-            x = self.final(x)
-
+            # MLP
+            x = self.MLP(x)
+            y = None
+        
         return x, y
 
 
@@ -623,7 +642,7 @@ class _MLPLayer(nn.Module):
         self.linear = nn.Linear(
             in_features=n_input_features,
             out_features=n_output_features,
-            bias=False if norm_func is not None else True
+            bias=True #False if norm_func is not None else True
         )
         """
         self.layer_funcs = nn.Sequential(

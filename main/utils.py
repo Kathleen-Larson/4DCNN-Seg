@@ -60,18 +60,6 @@ def arg_error(instr, cls=None):
         fatal(f'Error in {cls.__class__.__name__}.__init__: {instr}')
 
 
-def print_gc(exclude_params=True):
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-                if exclude_params:
-                    if 'parameter' not in str(type(obj)):
-                        print(type(obj), obj.size())
-                else:
-                    print(type(obj), obj.size())
-        except:
-            pass
-
 def print_gpu_memory_info(idx=0):
     device = torch.device('cuda', idx)
     mem_res = torch.cuda.memory_reserved(device)
@@ -180,7 +168,7 @@ def load_volume(path,                 # Path to load
     # Conform
     n_dims = len(x.data.shape)
     shape = [shape] * n_dims if isinstance(shape, int) else shape
-    
+
     if not is_slice:
         x = x.conform(
             shape=shape if conform else geom.shape,
@@ -263,7 +251,7 @@ def save_volume(x,                     # image data
             orientation=input_geom.orientation,
             method='nearest' if is_labels else 'linear'
         )
-    
+
     if label_lut is not None and is_labels:
         x.labels = label_lut
 

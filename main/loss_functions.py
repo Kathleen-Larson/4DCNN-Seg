@@ -34,6 +34,21 @@ def cce_loss(output, target, possible, weight=1., reduction='mean'):
 # --------------------------------------------------------------------------------------------------
 # Dice losses
 
+def binary_change_loss(output, target, weight=1., eps=1e-5, compute_softmax=True,
+                     exclude_background=False):
+    nB, nC, nT = target.shape[:3]
+    idx = 1 if exclude_background else 0
+
+    output = torch.where(output.argmax(dim=1).diff(dim=1) == 0, 1, 0)
+    target = torch.where(target.argmax(dim=1).diff(dim=1) == 0, 1, 0)
+
+    numer = (2 * output * target).sum(dim=-1)
+    denom = (output + target).sum(dim=-1)
+    dice = (numer + eps) / (denom + eps)
+
+    loss = (1 - dice).mean()
+    return weight * loss
+
 def mean_dice_loss(output, target, weight=1., eps=1e-5, compute_softmax=True, compute_diff=False,
                    exclude_background=False):
     nB, nC, nT = target.shape[:3]

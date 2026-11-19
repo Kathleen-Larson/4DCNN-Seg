@@ -327,7 +327,7 @@ class SynthLongitudinal(nn.Module):
                   y1.squeeze().movedim(0, -1).cpu().numpy(), 
                   X.squeeze().movedim(0, -1).cpu().numpy())
             pdb.set_trace()
-
+        
         return (X, y, atrophy_dict) if self.return_sdict is True else (X, y)
 
 
@@ -853,9 +853,6 @@ class _ResizeLabels(nn.Module):
             # if debug:
             vc = vol_change
             tvc = trg_change
-            if label == 4 or label == 43:
-                print(f'label {label}: vol_change {vc:.4f}, requested {tvc:.4f} in {it} iters')
-
             out_dict[label] = [vol_change] + nbr_list
 
         return x, out_dict
@@ -868,30 +865,32 @@ class _ResizeLabels(nn.Module):
         sdict = {}
 
         # Get idxs of target structures to atrophy vs. others
-        s_targ = set(
-            random.sample(self.sdict.keys(), random.randint(1, len(self.sdict)))
-        ) if len(self.sdict) > 0 else None
-        s_other = random.sample(self.neighbors_dict.keys(), k=len(self.neighbors_dict))
+        s_targ = (
+            set(random.sample(self.sdict.keys(), random.randint(1, len(self.sdict))))
+            if len(self.sdict) > 0 else None
+        ) if self.randomize else self.sdict.keys()
+
+        s_other = random.sample(list(self.neighbors_dict.keys()), k=len(self.neighbors_dict))
         s_other = set(s_other) - s_targ if s_targ is not None else set(s_other)
 
         # Add non-targets first w/ minimal atrophy
-        for label in s_other:
-            amt = (
-                random.uniform(self.control_bounds[0], self.control_bounds[1]) if self.randomize
-                else 0.5 * sum(self.control_bounds[0] + self.control_bounds[1])
-            )
-            nbrs = random.sample(self.neighbors_dict[label], k=len(self.neighbors_dict[label]))
-            sdict[label] = [amt] + nbrs
+        if self.randomize:
+            for label in s_other:
+                amt = (
+                    random.uniform(self.control_bounds[0], self.control_bounds[1]) if self.randomize
+                    else 0.5 * (self.control_bounds[0] + self.control_bounds[1])
+                )
+                nbrs = random.sample(self.neighbors_dict[label], k=len(self.neighbors_dict[label]))
+                sdict[label] = [amt] + nbrs
 
-        # Now add target structures
         if s_targ is not None:
             for label in s_targ:
-                amt = 0
-                while (amt > self.control_bounds[0] * 2) and (amt < self.control_bounds[1] * 2):
-                    amt = (
-                        random.uniform(self.sdict[label][0], self.sdict[label][1]) if self.randomize
-                        else 0.5 * sum(self.sdict[label][0] + self.sdict[label][1])
-                    )
+                if self.randomize:
+                    amt = 0
+                    while (amt > self.control_bounds[0] * 2) and (amt < self.control_bounds[1] * 2):
+                        amt = random.uniform(self.sdict[label][0], self.sdict[label][1])
+                else:
+                    amt = self.sdict[label][np.argmax(np.abs( self.sdict[label]))]
                 nbrs = random.sample(self.neighbors_dict[label], k=len(self.neighbors_dict[label]))
                 sdict[label] = [amt] + nbrs
 
@@ -900,7 +899,6 @@ class _ResizeLabels(nn.Module):
     def forward(self, x):
         sdict = self._configure_sdict()
         x, odict = self._resize_labels(x, sdict)
-
         return (x, odict) if self.return_dict else x
 
 
@@ -961,10 +959,10 @@ def _config_synth_models(
     for key, val in synth_image_lut.items():
         if key in synth_labels_lut:
             seg_dict[key] = key
-        elif 'ctx-lh' in val.name:
-            seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-Cortex')[0]
-        elif 'ctx-rh' in val.name:
-            seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-Cortex')[0]
+        #elif 'ctx-lh' in val.name:
+        #    seg_dict[key] = search_lut(synth_image_lut, 'Left-Cerebral-Cortex')[0]
+        #elif 'ctx-rh' in val.name:
+        #    seg_dict[key] = search_lut(synth_image_lut, 'Right-Cerebral-Cortex')[0]
         else:
             seg_dict[key] = 0
 
